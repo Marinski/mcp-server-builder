@@ -191,9 +191,39 @@ throwaway path for exactly this reason.
 
 - `claude` (Claude Code) and/or `opencode`
 - Python 3.9+ with PyYAML, for the runner
-- Optionally, the plugins providing the skills the playbook names — see [NOTICE](NOTICE).
-  Every stage prompt is a complete spec without them; a session that lacks a named skill
-  is told to say so and follow the prompt's own structure.
+- Optionally, the plugins providing the skills the playbook names — see below. Every
+  stage prompt is a complete spec without them; a session that lacks a named skill is
+  told to say so and follow the prompt's own structure.
+
+## Installing the skills the playbook names
+
+Four plugins, from three marketplaces. Provenance and licensing are in [NOTICE](NOTICE).
+
+```bash
+claude plugin marketplace add bitovi/ai-enablement-prompts
+claude plugin install code@bitovi-ai-enablement
+claude plugin install implement-workflow@bitovi-ai-enablement
+
+claude plugin marketplace add anthropics/knowledge-work-plugins
+claude plugin install engineering@knowledge-work-plugins
+
+claude plugin marketplace add pskoett/pskoett-skills
+claude plugin install pskoett-ai-skills@pskoett-skills
+```
+
+Note the marketplace ids differ from the repo names — Bitovi's registers as
+`bitovi-ai-enablement`, not `ai-enablement-prompts`.
+
+**Install them with the CLI, not the desktop app.** A plugin installed into Claude
+Cowork or an app session lives under `~/.claude/remote/plugins/` and is invisible to
+`claude -p` — which is exactly what the runner spawns. A stage whose skill is missing
+does not fail: the model quietly follows the prompt's own structure and produces
+well-formed output, so the gap hides for an entire run. Verify against the CLI rather
+than trusting a skill list you saw in the app:
+
+```bash
+echo 'Is engineering:architecture a registered skill available to you right now? Answer YES or NO only.' | claude -p
+```
 
 ## Prior art
 

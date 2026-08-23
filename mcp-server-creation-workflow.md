@@ -3,14 +3,18 @@
 A reusable, agent-driven pipeline that turns an existing codebase into a working MCP server.
 Each stage runs in a **fresh agent session** and communicates only through files on disk.
 
-Agents are the vendored copies in `agents/` (from the agency-agents marketplace). Skills are
-Bitovi's AI-enablement prompts (`code:*`, `implement-workflow:*`) plus the `engineering:*`
-plugin — see [NOTICE](NOTICE) for provenance. **Every named skill is an optional accelerator,
-not a dependency.** A stage session sees only the plugins actually installed and enabled where
-it runs, and a model whose registry lacks a named skill will quietly follow the prompt's
-structure instead — which produces well-formed output while hiding that the skill never ran.
-So every stage prompt below is a complete spec on its own, and every skill invocation tells
-the agent what to do when the skill is missing: say so in one line, then follow the prompt.
+Agents are the vendored copies in `agents/` (from the agency-agents marketplace). Skills come
+from four plugins — `code` and `implement-workflow` (Bitovi), `engineering` (Anthropic), and
+`pskoett-ai-skills` — installed from three marketplaces; see [NOTICE](NOTICE) for provenance
+and `README.md` § "Installing the skills the playbook names" for the commands.
+
+**Every named skill is an optional accelerator, not a dependency.** A stage session sees only
+the plugins installed where it actually runs — and plugins installed into the desktop app are
+invisible to the `claude -p` sessions the runner spawns. A model whose registry lacks a named
+skill will quietly follow the prompt's structure instead, producing well-formed output while
+hiding that the skill never ran. So every stage prompt below is a complete spec on its own,
+and every skill invocation tells the agent what to do when the skill is missing: say so in one
+line, then follow the prompt.
 
 ---
 
@@ -497,7 +501,7 @@ Report actual pass/fail output. Do not mark a layer complete without running it.
 review; `agency-engineering:Minimal Change Engineer` (`agents/engineering-minimal-change-engineer.md`)
 for the simplify pass — it is briefed to refuse scope creep, which is what keeps a hardening
 pass from turning into a refactor.
-**Skills:** `engineering:code-review`, then `simplify`.
+**Skills:** `engineering:code-review`, then `pskoett-ai-skills:simplify-and-harden`.
 
 ```
 Review {{SERVER}} for release. Write findings to {{DOCS}}/06-review.md, severity-ordered,
@@ -523,20 +527,24 @@ Model ergonomics:
 - Read every tool description as if you were the model. Which two tools could be confused?
   Which description fails to say when NOT to use it? Fix the descriptions.
 
-Then run the simplify skill: remove dead abstraction, collapse needless indirection, delete
-speculative generality. If that skill is not registered in this session, say so in one line
-and do that pass directly. Do not change behaviour. Re-run build, tests, and lint; paste
-the output.
+Then run the pskoett-ai-skills:simplify-and-harden skill: remove dead abstraction, collapse
+needless indirection, delete speculative generality. If that skill is not registered in this
+session, say so in one line and do that pass directly. Do not change behaviour. Re-run build,
+tests, and lint; paste the output.
+
+That skill's harden pass overlaps the security review above. Treat the review as
+authoritative: anything harden raises that the review missed is a finding to add to
+06-review.md, not a licence to re-open decisions the review already settled.
 ```
 
-> **Verify `simplify`'s own completion — do not trust its report.** It has been observed to
+> **Verify the simplify pass's own completion — do not trust its report.** It has been observed to
 > spawn several nested background review agents, then return as though finished before they
 > actually completed, with zero edits applied despite reporting done. Their findings were not
 > lost — they could be recovered and applied manually — but the skill's own "done" was false.
 > Check the actual diff after it runs, not just its final message.
 
 > **Never run two fix-applying review agents concurrently against the same tree.** Both this
-> stage's review pass and its `simplify` pass write to the same files. If you parallelise review
+> stage's review pass and its simplify-and-harden pass write to the same files. If you parallelise review
 > work, only concurrent *read-only* agents or ones scoped to disjoint, isolated trees are safe —
 > two agents both allowed to apply fixes against the same working tree at once is a real
 > near-miss waiting to happen (one run caught this only by manually stopping an agent mid-run).
@@ -583,7 +591,7 @@ the code wins and you note the drift.
 Run once at the end, while it is fresh.
 
 ```
-Use the anthropic-skills:self-improvement skill. If that skill is not registered in this
+Use the pskoett-ai-skills:self-improvement skill. If that skill is not registered in this
 session, say so in one line and follow this prompt's structure instead.
 
 Review this MCP server build end to end. Capture, as durable learnings:
@@ -610,9 +618,9 @@ Then write the revised prompt text back into
 | 4 | Spec + check | Product Manager | `code:spec`, `code:spec-answered-questions`, `code:spec-check` | `04-spec.md` | human answers questions |
 | 5 | Implement, phase by phase | MCP Builder | `code:spec-implement`, `implement-workflow:ready-to-push` | code | gate green per phase |
 | 6 | Test L1–L4 | Test Automation Engineer | `engineering:testing-strategy` | `05-test-plan.md`, tests | Inspector smoke passes |
-| 7 | Harden | Code Reviewer + AppSec Engineer + Minimal Change Engineer | `engineering:code-review`, `simplify` | `06-review.md` | HIGH+ findings fixed |
+| 7 | Harden | Code Reviewer + AppSec Engineer + Minimal Change Engineer | `engineering:code-review`, `pskoett-ai-skills:simplify-and-harden` | `06-review.md` | HIGH+ findings fixed |
 | 8 | Package | Technical Writer | `engineering:documentation` | `README.md`, `07-release.md` | real client, real task |
-| 9 | Retro | — | `anthropic-skills:self-improvement` | updated playbook | — |
+| 9 | Retro | — | `pskoett-ai-skills:self-improvement` | updated playbook | — |
 
 ### Rules that make this work
 
