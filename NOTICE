@@ -1,0 +1,28 @@
+# Third-party content
+
+## Agent personas — agents/
+
+The nine agent persona files in `agents/` are vendored from the **agency-agents**
+project by msitarzewski and contributors:
+
+    https://github.com/msitarzewski/agency-agents
+
+They are used under the MIT License (Copyright (c) 2025 AgentLand Contributors),
+which permits redistribution. The upstream project states: "Use freely,
+commercially or personally. Attribution appreciated but not required."
+
+They are vendored rather than referenced so that an upstream change cannot alter
+a persona in the middle of a pipeline run. Files are unmodified; see each file's
+own frontmatter for its original name and description.
+
+## Skills — referenced, not redistributed
+
+The playbook invokes skills by name. None of their content is copied into this
+repository:
+
+- `code:*` and `implement-workflow:*` — Bitovi's AI-enablement prompts
+  https://github.com/bitovi
+- `engineering:*` — the engineering plugin
+- `simplify`, `anthropic-skills:self-improvement` — Anthropic-provided
+
+You must have the corresponding plugins installed for those stages to run.

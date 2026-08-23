@@ -1,0 +1,10 @@
+# Your own routing config — copied from models.example.yaml. May name private
+# endpoints via env vars, and is per-machine anyway.
+models.yaml
+
+# Pipeline artifacts belong to the repo being wrapped, never to this one.
+docs/mcp/
+*.local.md
+
+__pycache__/
+*.pyc

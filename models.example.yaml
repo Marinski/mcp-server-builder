@@ -1,0 +1,92 @@
+# Per-stage model routing for mcp-server-builder.
+#
+# Copy to models.yaml (gitignored) and edit. Every value that could identify your
+# infrastructure is read from an environment variable, so this file stays safe to commit.
+#
+#   cp models.example.yaml models.yaml
+#
+# Two runners, because they reach different things:
+#
+#   claude    - Anthropic message shape (/v1/messages). Skills and agent personas are
+#               native. Has a built-in fallback chain (--fallback-model a,b,c) but only
+#               within one provider.
+#   opencode  - OpenAI-compatible (/v1/chat/completions) and every provider the Vercel AI
+#               SDK supports. This is what lets you point a stage at a local model, a
+#               LiteLLM gateway, or any OpenAI-compatible vendor.
+#
+# A gateway that speaks both shapes (LiteLLM does) can serve either runner.
+
+runners:
+  claude:
+    cmd: claude
+    # Non-interactive invocation. {model}/{fallback}/{prompt_file} are substituted.
+    args: ["-p", "--model", "{model}", "--fallback-model", "{fallback}"]
+  opencode:
+    cmd: opencode
+    args: ["run", "-m", "{model}", "--format", "json"]
+
+providers:
+  # Anthropic direct. The default, and the only one enabled out of the box.
+  anthropic:
+    runner: claude
+    api_key_env: ANTHROPIC_API_KEY
+    # base_url_env is optional; omit to use the vendor default.
+    base_url_env: ANTHROPIC_BASE_URL
+
+  # --- OpenAI-compatible examples. Uncomment and point at your own endpoint. ---
+  #
+  # Any OpenAI-compatible endpoint: LiteLLM, vLLM, Ollama, OpenRouter, a vendor API.
+  # Model names are written as provider/model for opencode's -m flag.
+  #
+  # gateway:
+  #   runner: opencode
+  #   api_key_env: MCP_BUILDER_GATEWAY_KEY
+  #   base_url_env: MCP_BUILDER_GATEWAY_URL
+  #
+  # local:
+  #   runner: opencode
+  #   api_key_env: MCP_BUILDER_LOCAL_KEY
+  #   base_url_env: MCP_BUILDER_LOCAL_URL
+
+# Applied to any stage that does not override them.
+defaults:
+  provider: anthropic
+  model: claude-sonnet-5
+  # Tried in order when the primary is unavailable, overloaded, or errors.
+  # Entries may name a different provider — the runner handles cross-provider fallback,
+  # since no single CLI can do that itself.
+  fallback:
+    - { provider: anthropic, model: claude-opus-5 }
+    - { provider: anthropic, model: claude-haiku-4-5-20251001 }
+
+# Per-stage overrides. Keys match the playbook's stage ids.
+#
+# Guidance on where model quality actually matters, from running this pipeline:
+#   Stages 2 and 3 produce judgement (the capability inventory and the MCP surface ADR).
+#   A weaker model degrades these quietly rather than failing loudly, and every later
+#   stage inherits the damage. Spend your best model here.
+#   Stages 1b and 8 are extraction and formatting. Cheap models do fine.
+stages:
+  "1a": {}                                  # onboarding doc — defaults are fine
+  "1b": {}                                  # signature extraction — safe to economise
+  "2":  { model: claude-opus-5 }            # capability inventory — the key artifact
+  "3":  { model: claude-opus-5 }            # MCP surface ADR — worst place to be cheap
+  "4":  {}                                  # implementation spec
+  "5":  {}                                  # implementation, phase by phase
+  "6":  {}                                  # tests
+  "7":  { model: claude-opus-5 }            # security hardening — judgement again
+  "8":  {}                                  # docs — extraction, cheap is fine
+  "9":  {}                                  # retro
+
+# Agent persona per stage, resolved from agents/. Overriding is rarely needed;
+# the mapping matches the playbook's Quick reference table.
+agents:
+  "1a": engineering-codebase-onboarding-engineer
+  "1b": engineering-codebase-onboarding-engineer
+  "2":  engineering-technical-writer
+  "3":  specialized-mcp-builder
+  "4":  product-manager
+  "5":  specialized-mcp-builder
+  "6":  testing-test-automation-engineer
+  "7":  engineering-code-reviewer
+  "8":  engineering-technical-writer
