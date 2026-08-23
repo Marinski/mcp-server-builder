@@ -5,8 +5,12 @@ Each stage runs in a **fresh agent session** and communicates only through files
 
 Agents are the vendored copies in `agents/` (from the agency-agents marketplace). Skills are
 Bitovi's AI-enablement prompts (`code:*`, `implement-workflow:*`) plus the `engineering:*`
-plugin. Every agent and skill named below is verified installed on this box — see
-`README.md` § "Agent and skill map" for the provenance table.
+plugin — see [NOTICE](NOTICE) for provenance. **Every named skill is an optional accelerator,
+not a dependency.** A stage session sees only the plugins actually installed and enabled where
+it runs, and a model whose registry lacks a named skill will quietly follow the prompt's
+structure instead — which produces well-formed output while hiding that the skill never ran.
+So every stage prompt below is a complete spec on its own, and every skill invocation tells
+the agent what to do when the skill is missing: say so in one line, then follow the prompt.
 
 ---
 
@@ -90,7 +94,8 @@ this document is wrong.
 ### 1a — Instructions file
 
 ```
-Use the code:instruction-generation skill on the codebase at {{REPO}}.
+Use the code:instruction-generation skill on the codebase at {{REPO}}. If that skill is not
+registered in this session, say so in one line and follow this prompt's structure instead.
 
 Goal: produce an onboarding document that a *different* AI agent with no prior context can
 read in one pass and then work productively in this codebase.
@@ -118,7 +123,8 @@ Rules:
 ### 1b — Signatures + dependency graph
 
 ```
-Use the code:signatures skill on {{REPO}}.
+Use the code:signatures skill on {{REPO}}. If that skill is not registered in this session,
+say so in one line and follow this prompt's structure instead.
 
 Write the result to {{DOCS}}/01-signatures.md.
 
@@ -218,7 +224,9 @@ The web-fetch step matters: the MCP specification is versioned and revises regul
 the agent design against whatever it remembers.
 
 ```
-You are designing the MCP surface for {{PROJECT}}. Use the engineering:architecture skill.
+You are designing the MCP surface for {{PROJECT}}. Use the engineering:architecture skill;
+if it is not registered in this session, say so in one line and follow this prompt's
+structure instead.
 
 STEP 1 — Ground yourself in the current spec. Fetch and read:
 - https://modelcontextprotocol.io/specification (find the LATEST revision, note its date)
@@ -325,7 +333,8 @@ your mind. Answer §9 inline in the file.
 
 ```
 Use the code:spec skill to produce {{DOCS}}/04-spec.md — an implementation spec for {{SERVER}},
-an MCP server for {{PROJECT}} in {{LANG}} using transport {{TRANSPORT}}.
+an MCP server for {{PROJECT}} in {{LANG}} using transport {{TRANSPORT}}. If that skill is not
+registered in this session, say so in one line and follow this prompt's structure instead.
 
 Authoritative inputs (read all, in this order):
 - {{DOCS}}/03-mcp-surface.md   ← the design. Do not redesign it. If you disagree, log it as a question.
@@ -362,12 +371,14 @@ Rules:
 ```
 I have answered the open questions inline in {{DOCS}}/04-spec.md.
 Use the code:spec-answered-questions skill to fold the answers into the body of the spec,
-remove the resolved questions, and keep the document internally consistent.
+remove the resolved questions, and keep the document internally consistent. If that skill
+is not registered in this session, say so in one line and do exactly that yourself.
 ```
 
 ```
 Use the code:spec-check skill on {{DOCS}}/04-spec.md, validated against {{REPO}} and
-{{DOCS}}/03-mcp-surface.md.
+{{DOCS}}/03-mcp-surface.md. If that skill is not registered in this session, say so in one
+line and perform the check this prompt describes yourself.
 
 Report: contradictions, redundancy, gaps, and any spec claim about {{PROJECT}} that the code
 does not support. Explicitly cross-check every numeric or enum constraint (valid ranges, limits,
@@ -391,6 +402,8 @@ confuse the model.
 
 ```
 Use the code:spec-implement skill to implement {{DOCS}}/04-spec.md, PHASE {{N}} ONLY.
+If that skill is not registered in this session, say so in one line and implement the
+phase directly under the constraints below.
 
 Before writing code, restate: this phase's scope, its acceptance criteria, and the files you
 will touch. Then implement.
@@ -426,8 +439,9 @@ Between phases, run the verify gate:
 ```
 Run the implement-workflow:ready-to-push skill on the current working tree.
 It runs tests → lint → format/type check → build in order, fixing and re-running each until it
-passes before moving to the next. Paste the actual output. Do not proceed to the next phase
-until it is green.
+passes before moving to the next. If that skill is not registered in this session, say so in
+one line and run that sequence yourself. Paste the actual output. Do not proceed to the next
+phase until it is green.
 ```
 
 ---
@@ -440,7 +454,8 @@ until it is green.
 
 ```
 Use the engineering:testing-strategy skill to produce {{DOCS}}/05-test-plan.md and then
-implement the tests for {{SERVER}} (spec: {{DOCS}}/04-spec.md).
+implement the tests for {{SERVER}} (spec: {{DOCS}}/04-spec.md). If that skill is not
+registered in this session, say so in one line and follow this prompt's structure instead.
 
 Four layers, all required:
 
@@ -509,7 +524,9 @@ Model ergonomics:
   Which description fails to say when NOT to use it? Fix the descriptions.
 
 Then run the simplify skill: remove dead abstraction, collapse needless indirection, delete
-speculative generality. Do not change behaviour. Re-run build, tests, and lint; paste the output.
+speculative generality. If that skill is not registered in this session, say so in one line
+and do that pass directly. Do not change behaviour. Re-run build, tests, and lint; paste
+the output.
 ```
 
 > **Verify `simplify`'s own completion — do not trust its report.** It has been observed to
@@ -534,7 +551,8 @@ speculative generality. Do not change behaviour. Re-run build, tests, and lint; 
 
 ```
 Use the engineering:documentation skill to write the README for {{SERVER}} and
-{{DOCS}}/07-release.md.
+{{DOCS}}/07-release.md. If that skill is not registered in this session, say so in one
+line and follow this prompt's structure instead.
 
 README (for a user who has never seen {{PROJECT}}):
 1. What this server lets an AI assistant do — 3 sentences, concrete.
@@ -565,7 +583,8 @@ the code wins and you note the drift.
 Run once at the end, while it is fresh.
 
 ```
-Use the anthropic-skills:self-improvement skill.
+Use the anthropic-skills:self-improvement skill. If that skill is not registered in this
+session, say so in one line and follow this prompt's structure instead.
 
 Review this MCP server build end to end. Capture, as durable learnings:
 - Which stage produced output the next stage could not use, and what was missing.

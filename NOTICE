@@ -25,4 +25,7 @@ repository:
 - `engineering:*` — the engineering plugin
 - `simplify`, `anthropic-skills:self-improvement` — Anthropic-provided
 
-You must have the corresponding plugins installed for those stages to run.
+The stages run without these plugins installed — every stage prompt in the playbook
+is a complete spec on its own, and instructs the agent to note a missing skill and
+follow the prompt's structure instead. Install the plugins only if you want the
+named skills to actually drive their stages.

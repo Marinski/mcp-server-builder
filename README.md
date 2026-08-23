@@ -134,6 +134,25 @@ An artifact does not otherwise say which model wrote it, so a stage that quietly
 to a weaker model is indistinguishable from one that did not — which matters most on
 exactly the stages where weak models degrade quietly.
 
+### Non-interactive sessions and permissions
+
+A `-p` stage session has no TTY to answer a permission prompt, so anything that would
+prompt is **declined by default**. Three consequences, each found the hard way:
+
+- **Working directory.** Claude Code confines file access to the directory it is launched
+  from. The runner therefore launches every stage with the *target repo* as its working
+  directory (derived from `--docs`, or set explicitly with `--cwd`) — otherwise a stage
+  invoked from this repo is silently sandboxed out of the repo it is meant to read and write.
+- **File writes.** Every stage writes its own artifact; without `--permission-mode
+  acceptEdits` the declined Write leaves the stage exiting 0 with no file on disk and the
+  document unrecoverable. The shipped `models.example.yaml` passes it. Deliberately not
+  `--dangerously-skip-permissions`, which would also unfence Bash (see Sandboxing below).
+- **WebFetch.** Fetches to unapproved domains are declined — Stage 3 needs package
+  registries and code hosting to verify the SDK version it designs against. Allowlist per
+  domain, either in the runner args (`models.yaml`): `"--allowedTools",
+  "WebFetch(domain:registry.npmjs.org)"` (repeat the flag per domain; verified to
+  accumulate), or in the target repo's `.claude/settings.json` under `permissions.allow`.
+
 ### Validation status
 
 The runner is exercised end to end, not just dry-run: a stage executes a real model
@@ -172,7 +191,9 @@ throwaway path for exactly this reason.
 
 - `claude` (Claude Code) and/or `opencode`
 - Python 3.9+ with PyYAML, for the runner
-- The plugins providing the skills the playbook invokes — see [NOTICE](NOTICE)
+- Optionally, the plugins providing the skills the playbook names — see [NOTICE](NOTICE).
+  Every stage prompt is a complete spec without them; a session that lacks a named skill
+  is told to say so and follow the prompt's own structure.
 
 ## Prior art
 

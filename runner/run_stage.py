@@ -9,6 +9,12 @@ Cross-provider fallback lives here because neither CLI can do it: `claude` has
 at all. Falling back from a hosted model to a local one is the case that matters
 when credits run out, so the runner owns it.
 
+The stage's CLI process runs with the *target repo* as its working directory
+(--cwd, derived from --docs when not given). Claude Code confines file access to
+the directory it is launched from, so inheriting whatever directory this script
+happened to be invoked from silently sandboxes the stage out of the repo it is
+supposed to read and write.
+
   ./runner/run_stage.py 2 --docs /path/to/repo/docs/mcp --dry-run
 """
 from __future__ import annotations
@@ -170,7 +176,14 @@ def main() -> int:
     ap.add_argument("stage", help="stage id as used in models.yaml (1a, 1b, 2, ... 9)")
     ap.add_argument("--config", type=Path, default=ROOT / "models.yaml")
     ap.add_argument("--prompt", type=Path, help="file containing the stage prompt")
-    ap.add_argument("--docs", type=Path, help="artifact dir, for the log line only")
+    ap.add_argument("--docs", type=Path,
+                    help="artifact dir; also the default for --manifest and --cwd")
+    ap.add_argument("--cwd", type=Path,
+                    help="working directory for the stage's CLI process (default: two levels "
+                         "above --docs, which is the target repo when DOCS is <repo>/docs/mcp). "
+                         "Claude Code confines file access to the directory it is launched "
+                         "from, so this must contain the target repo — not wherever this "
+                         "script was invoked from.")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the resolved chain and commands without running")
     ap.add_argument("--manifest", type=Path,
@@ -181,13 +194,26 @@ def main() -> int:
     cfg = load_config(args.config)
     chain = resolve_chain(cfg, args.stage)
 
+    cwd = args.cwd or (args.docs.resolve().parent.parent if args.docs else None)
+    if cwd is not None:
+        cwd = cwd.resolve()
+        if not cwd.is_dir():
+            sys.exit(f"stage working dir {cwd} is not a directory (from "
+                     + ("--cwd" if args.cwd else "--docs") + ")")
+        if args.docs and not args.docs.resolve().is_relative_to(cwd):
+            sys.exit(f"--docs {args.docs} is outside the stage working dir {cwd}; "
+                     "the stage session could not write its artifact. Pass --cwd "
+                     "with a directory that contains --docs.")
+
     agent = (cfg.get("agents") or {}).get(args.stage)
     print(f"stage {args.stage}"
           + (f"  agent={agent}" if agent else "")
-          + (f"  docs={args.docs}" if args.docs else ""), file=sys.stderr)
+          + (f"  docs={args.docs}" if args.docs else "")
+          + (f"  cwd={cwd}" if cwd else ""), file=sys.stderr)
     print("  chain: " + " -> ".join(f"{c['provider']}/{c['model']}" for c in chain), file=sys.stderr)
 
-    prompt_file = args.prompt or Path(os.devnull)
+    # Absolute, because the child process may run in a different working directory.
+    prompt_file = args.prompt.resolve() if args.prompt else Path(os.devnull)
 
     for i, attempt in enumerate(chain):
         # Models later in the chain that share this provider can be handed to
@@ -209,7 +235,7 @@ def main() -> int:
         print(f"  [{i + 1}/{len(chain)}] running {label}", file=sys.stderr)
         stdin = prompt_file.open() if args.prompt else subprocess.DEVNULL
         try:
-            result = subprocess.run(argv, env=env, stdin=stdin)
+            result = subprocess.run(argv, env=env, stdin=stdin, cwd=cwd)
         finally:
             if args.prompt:
                 stdin.close()

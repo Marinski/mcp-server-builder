@@ -23,7 +23,18 @@ runners:
   claude:
     cmd: claude
     # Non-interactive invocation. {model}/{provider}/{fallback}/{prompt_file} substitute.
-    args: ["-p", "--model", "{model}", "--fallback-model", "{fallback}"]
+    # acceptEdits: a -p session has no TTY to answer a permission prompt, so an unanswered
+    # Write/Edit is silently declined by default — a stage that writes its own artifact
+    # (every stage does) fails closed with no file on disk and no salvageable output. This
+    # is narrower than --dangerously-skip-permissions: it only auto-accepts file edits, not
+    # arbitrary Bash execution.
+    args: ["-p", "--model", "{model}", "--fallback-model", "{fallback}", "--permission-mode", "acceptEdits"]
+    # WebFetch is gated the same way: a -p session declines fetches to domains that were
+    # never approved. Stage 3 needs package registries and code hosting to verify SDK
+    # versions (modelcontextprotocol.io tends to pass; npmjs / raw.githubusercontent do
+    # not). Verified fix: append per-domain allow rules to the args above, e.g.
+    #   "--allowedTools", "WebFetch(domain:registry.npmjs.org)", "--allowedTools", "WebFetch(domain:raw.githubusercontent.com)"
+    # or put the same rules in the target repo's .claude/settings.json permissions.allow.
     base_url_var: ANTHROPIC_BASE_URL
     api_key_var: ANTHROPIC_API_KEY
     # Claude Code can authenticate by OAuth, so a missing API key is not an error.
