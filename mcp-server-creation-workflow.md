@@ -75,6 +75,14 @@ Every stage writes exactly these files. Later stages read them instead of re-cra
 > analysis inline and emit only the stage's own output document. Verify with `git status`
 > before you finish.
 
+> **Absolute claims decay.** Any "zero X" or "always Y" claim written into `01-instructions.md` —
+> zero runtime dependencies, always validates before writing, etc. — is a snapshot of the source
+> at write time, not a permanent fact. A later stage that trusts it without re-checking can run on
+> a stale claim for stages before anyone notices: on one run, a "zero runtime dependencies" claim
+> here was wrong by Stage 4b, three stages after it was written. Any stage about to make a design
+> or spec decision on a claim from an earlier artifact re-verifies it against current source
+> first — it does not inherit it as fact.
+
 The agent matters here: it is briefed to state only facts grounded in source and to trace code
 paths rather than summarise the README. That is exactly the failure mode Stage 2 inherits if
 this document is wrong.
@@ -124,6 +132,13 @@ and whether it reads state, mutates state, or performs I/O.
 End with a mermaid dependency graph of the modules involved.
 Flag any entry that is exported but appears to be internal-only (unused externally, or marked
 @internal / private-by-convention).
+
+Do not trust this brief's own assumptions, or any existing doc's, about which script is
+library-only, which function is an internal helper, or which entry point is unreachable —
+verify every such claim by grepping for actual call sites and process-spawn invocations across
+the whole repo. Two real cases on one run were wrong this way: a script assumed "library-only"
+was also spawned as a subprocess elsewhere, and a function assumed to be an "internal helper"
+had zero callers and was really an independent third entry point.
 ```
 
 ---
@@ -171,6 +186,15 @@ Is that a parameter, ambient config, or session state?
 
 Part F — Open questions for the maintainer. Numbered, answerable, blocking-first.
 
+Part G — Structured-output check (wrap mode only; skip if MODE=embed). For every capability
+whose result a caller needs back in machine-readable form — an id to reference in a later call,
+a status enum, a count — confirm there is an actual machine-readable channel for it TODAY, not
+just a human-readable success message. A CLI that prints "Backtest submitted" with the id only
+in prose, or an HTTP response that 200s with no body, means the capability cannot be composed
+into a second tool call without a separate lookup. Flag every such gap here; this is the
+cheapest stage to catch it — a real one surfaced three stages late, at Stage 4a, because Stage 2
+did not check for it.
+
 Rules:
 - Every row cites a source location. If you cannot find the implementation, mark it UNVERIFIED.
 - Target 2–5 pages. Density over completeness of prose.
@@ -200,6 +224,13 @@ STEP 1 — Ground yourself in the current spec. Fetch and read:
 - https://modelcontextprotocol.io/specification (find the LATEST revision, note its date)
 - the tools, resources, and prompts pages of that revision
 - the {{LANG}} SDK README/docs for the version you will use
+- confirm the {{LANG}} SDK package is actually published and installable — check its registry
+  page, not just a README mention. A real v1-vs-v2 name ambiguity has surfaced this way before.
+- for any SDK convenience behaviour the design will lean on (pagination, batching, retries),
+  verify it against the SDK's actual source or installed package, not the protocol spec alone.
+  The protocol spec describes what a compliant server may do; it does not describe what a
+  specific SDK's helper actually implements. One run's ADR assumed cursor-based pagination that
+  the installed SDK did not support.
 Record in your output: spec revision date, SDK name and version.
 If anything below contradicts the current spec, the spec wins — flag the conflict explicitly.
 
@@ -276,6 +307,12 @@ your mind. Answer §9 inline in the file.
 > will be once fixed — that answer changes the tool surface substantially, and it belongs in
 > `00-decisions.md`.
 
+> **Cite capability IDs, not counts, in `00-decisions.md`.** A decision that names "3 tools" or
+> "the read-only subset" is easy to miscount against the ADR's actual tool catalog. One run's own
+> decision said 3 when the ADR it was describing actually allocated 5. Any decision restricting
+> or naming a subset of tools must list the canonical capability IDs (`C4`, `C7`, ...) inline —
+> never just a count or a category label.
+
 ---
 
 ## Stage 4 — PM: implementation spec
@@ -333,7 +370,12 @@ Use the code:spec-check skill on {{DOCS}}/04-spec.md, validated against {{REPO}}
 {{DOCS}}/03-mcp-surface.md.
 
 Report: contradictions, redundancy, gaps, and any spec claim about {{PROJECT}} that the code
-does not support. Then apply the fixes. List what you changed.
+does not support. Explicitly cross-check every numeric or enum constraint (valid ranges, limits,
+allowed values) against every other place the spec states or exercises it — including its own
+acceptance-criteria test values. One run's contradiction-detection step missed exactly this: a
+config's own valid-range declaration contradicted the value its own acceptance-criteria test
+used, because nothing forced a cross-section check on constraints specifically. Then apply the
+fixes. List what you changed.
 ```
 
 **Human gate:** skim the tool sections. If a tool's description would confuse *you*, it will
@@ -363,6 +405,17 @@ Constraints:
   error messages, or tool output.
 - Any tool marked "confirmation required" in 03-mcp-surface.md must not execute its side effect
   without the explicit confirmation flow the spec defines.
+- Do not assume POSIX filesystem/process semantics. If the target platform includes Windows, or
+  you cannot rule it out, verify timestamp, file-copy, and process-spawn behaviour directly
+  against that platform rather than by analogy. A backup-freshness check on one run broke on
+  Windows' file-copy timestamp behaviour, which differs from POSIX's in exactly the way that
+  check relied on.
+- When this phase implements a capability that is structurally similar to one built in an
+  earlier phase (e.g. two different ways of running the same underlying job), re-verify that any
+  reliability property the earlier phase established still holds for this one — it can silently
+  not, because the two are built differently under the hood. On one run, a locally-run job's
+  status silently lost the "survives restart" property its pipeline-run sibling had, because the
+  two were implemented on different mechanisms and nobody re-checked the property transferred.
 
 When done: run the project's build, tests, and lint. Paste the actual output. Then state which
 acceptance criteria pass and which do not. Do not claim success you have not observed.
@@ -411,6 +464,11 @@ L4 Manual smoke — a checklist for MCP Inspector: launch command, each tool exe
 Also add: a test that every tool's description is non-empty and mentions when NOT to use it,
 and a snapshot test on the tool list so surface changes are never silent.
 
+Any test that polls on a wall-clock timeout (waiting for a job to finish, a file to appear, a
+process to exit) must justify that number against real observed contention — paste the
+measurement that produced it. A timeout picked in isolation, without measuring actual latency
+under load, is usually wrong in one direction or the other and becomes a flaky test either way.
+
 Report actual pass/fail output. Do not mark a layer complete without running it.
 ```
 
@@ -453,6 +511,18 @@ Model ergonomics:
 Then run the simplify skill: remove dead abstraction, collapse needless indirection, delete
 speculative generality. Do not change behaviour. Re-run build, tests, and lint; paste the output.
 ```
+
+> **Verify `simplify`'s own completion — do not trust its report.** It has been observed to
+> spawn several nested background review agents, then return as though finished before they
+> actually completed, with zero edits applied despite reporting done. Their findings were not
+> lost — they could be recovered and applied manually — but the skill's own "done" was false.
+> Check the actual diff after it runs, not just its final message.
+
+> **Never run two fix-applying review agents concurrently against the same tree.** Both this
+> stage's review pass and its `simplify` pass write to the same files. If you parallelise review
+> work, only concurrent *read-only* agents or ones scoped to disjoint, isolated trees are safe —
+> two agents both allowed to apply fixes against the same working tree at once is a real
+> near-miss waiting to happen (one run caught this only by manually stopping an agent mid-run).
 
 ---
 
@@ -536,3 +606,7 @@ Then write the revised prompt text back into
    nothing; a tool the model misuses costs you trust.
 5. **Demand pasted command output** at every verification point. "Tests pass" without output is
    not evidence.
+6. **Never run two fix-applying agents concurrently against the same working tree**, in any
+   stage. Concurrent agents are only safe when every one of them is read-only, or each is scoped
+   to a disjoint, isolated tree. Two agents both able to write against the same tree at once is
+   how a run loses track of what actually changed.
