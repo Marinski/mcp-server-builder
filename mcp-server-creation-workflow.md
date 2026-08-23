@@ -68,6 +68,13 @@ Every stage writes exactly these files. Later stages read them instead of re-cra
 **Agent:** `agency-engineering:Codebase Onboarding Engineer` (`agents/engineering-codebase-onboarding-engineer.md`)
 **Skills:** `code:instruction-generation`, then `code:signatures`.
 
+> **Skills that write into the target repo.** `code:instruction-generation` emits several
+> intermediate artifacts and targets `.github/copilot-instructions.md`. That collides with
+> this stage being read-only, with the artifact contract, and — if the project already has
+> a `copilot-instructions.md` — with a tracked file it will overwrite. Run the skill's
+> analysis inline and emit only the stage's own output document. Verify with `git status`
+> before you finish.
+
 The agent matters here: it is briefed to state only facts grounded in source and to trace code
 paths rather than summarise the README. That is exactly the failure mode Stage 2 inherits if
 this document is wrong.
@@ -220,8 +227,13 @@ STEP 3 — Write {{DOCS}}/03-mcp-surface.md as an ADR containing:
    - description written FOR THE MODEL: when to use it, when NOT to, what it does not do
    - input JSON Schema sketch, with per-field descriptions, enums, and constraints
    - output: structured content shape, plus what the text summary says
-   - annotations/hints: read-only, destructive, idempotent, open-world
-   - confirmation required? (yes/no) and what the confirmation must display
+   - annotations/hints: read-only, destructive, idempotent, open-world. Check the field
+     names against the revision you fetched, and note that clients treat annotations as
+     UNTRUSTED — they are a hint to the host, never an enforcement mechanism.
+   - confirmation required? (yes/no) and what the confirmation must display. Confirmation
+     is **not a server-side protocol capability** in any revision published so far: it is
+     an obligation on the client. Say what the server does to make the side effect
+     impossible without confirmation, because declaring an annotation does not.
    - errors: which failures are tool-level results the model can recover from vs protocol errors
    - source capability ID(s)
 
@@ -253,6 +265,16 @@ Rules:
 
 **Human gate:** read this document yourself before continuing. It is the cheapest place to change
 your mind. Answer §9 inline in the file.
+
+> **Expect to find defects in the wrapped product.** Deciding what an autonomous caller may
+> do forces a harder look at the authorization model than feature work ever does, so stages
+> 2 and 3 routinely surface real vulnerabilities — missing object-level authorization is the
+> common one, because a UI that only ever passes a user their own ids hides it completely.
+> When it happens: fork the findings to a separate security track rather than absorbing them
+> into this pipeline, and verify each one in source yourself before it drives a design
+> decision. Then decide explicitly whether to design against the product as it is, or as it
+> will be once fixed — that answer changes the tool surface substantially, and it belongs in
+> `00-decisions.md`.
 
 ---
 
