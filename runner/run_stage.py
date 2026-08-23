@@ -14,6 +14,8 @@ when credits run out, so the runner owns it.
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import os
 import shutil
 import subprocess
@@ -130,6 +132,31 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
     return argv, env
 
 
+def record_attempt(args, attempt: dict, index: int, total: int, returncode: int) -> None:
+    """Append what actually ran to a manifest.
+
+    An artifact does not record which model produced it, so a run is otherwise
+    unreproducible and unauditable: a stage that silently fell back to a weaker
+    model looks identical to one that did not. The manifest is what lets a later
+    reader tell the difference, and what makes a bad artifact traceable to a
+    routing decision rather than to the prompt.
+    """
+    path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "stage": args.stage,
+            "provider": attempt["provider"],
+            "model": attempt["model"],
+            "attempt": f"{index + 1}/{total}",
+            "returncode": returncode,
+            "ok": returncode == 0,
+        }) + "\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -139,6 +166,9 @@ def main() -> int:
     ap.add_argument("--docs", type=Path, help="artifact dir, for the log line only")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the resolved chain and commands without running")
+    ap.add_argument("--manifest", type=Path,
+                    help="append a record of what actually ran to this JSONL file "
+                         "(default: <docs>/run-manifest.jsonl when --docs is given)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -176,6 +206,7 @@ def main() -> int:
         finally:
             if args.prompt:
                 stdin.close()
+        record_attempt(args, attempt, i, len(chain), result.returncode)
         if result.returncode == 0:
             print(f"  ok: {label}", file=sys.stderr)
             return 0

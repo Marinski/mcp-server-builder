@@ -23,8 +23,10 @@ rules prevent it:
 - **Never skip the design stage.** Going straight from capability inventory to
   implementation spec reliably produces one tool per endpoint.
 
-There is deliberately **no orchestrator that runs all nine stages in one process** —
-that would reintroduce the shared context the design exists to avoid.
+There is deliberately **no single process that runs all nine stages in one context** —
+that would reintroduce the shared history the design exists to avoid. You can still
+orchestrate the run: see [ORCHESTRATION.md](ORCHESTRATION.md) for the two execution
+models, and for the one discipline rule that keeps an orchestrated run honest.
 
 ## Quick start
 
@@ -105,6 +107,17 @@ Inspect what a stage would run, without calling anything:
 ./runner/run_stage.py 2 --dry-run
 ```
 
+Every real run appends to `docs/mcp/run-manifest.jsonl` in the target project, recording
+which provider and model produced each artifact and whether the chain fell back:
+
+```json
+{"ts":"...","stage":"2","provider":"anthropic","model":"claude-opus-5","attempt":"1/2","ok":true}
+```
+
+An artifact does not otherwise say which model wrote it, so a stage that quietly fell back
+to a weaker model is indistinguishable from one that did not — which matters most on
+exactly the stages where weak models degrade quietly.
+
 ### Where model quality actually matters
 
 Learned from running this pipeline, not assumed:
@@ -114,16 +127,37 @@ Learned from running this pipeline, not assumed:
   failing loudly, and every later stage inherits the damage. Spend your best model here.
 - **Stages 1b and 8 are extraction and formatting.** Cheap or local models do fine.
 
+## Sandboxing
+
+This repo ships **no permission system**. From Stage 5 onward the agents have write access
+to the target repository, and they run whatever build, test and lint commands that project
+defines. Treat a pipeline run as executing untrusted code.
+
+Run it in a container, VM, or an agent sandbox with a policy you control, against a clone
+rather than your only copy of the repo. The reference run used a fresh clone on a
+throwaway path for exactly this reason.
+
 ## Requirements
 
 - `claude` (Claude Code) and/or `opencode`
 - Python 3.9+ with PyYAML, for the runner
 - The plugins providing the skills the playbook invokes — see [NOTICE](NOTICE)
 
+## Prior art
+
+[`earendil-works/pi`](https://github.com/earendil-works/pi) is an agent harness with a
+unified multi-provider LLM API. Three of its choices influenced this repo: being explicit
+that there is no built-in permission system and that isolation belongs to the deployment
+(the Sandboxing section above), treating provider selection as an abstraction rather than
+a hardcoded vendor, and pinning what you can so a run is reproducible — which is what the
+run manifest is for here. It has no subagent or delegation mechanism, so the orchestration
+model in [ORCHESTRATION.md](ORCHESTRATION.md) is not derived from it.
+
 ## Layout
 
 ```
 mcp-server-creation-workflow.md   the playbook — the actual pipeline
+ORCHESTRATION.md                  execution models, and the anti-leakage rule
 new-project.sh                    scaffolds a run (Stage 0)
 models.example.yaml               model routing; copy to models.yaml
 runner/run_stage.py               resolves stage -> provider -> CLI, with fallback
