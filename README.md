@@ -134,6 +134,21 @@ An artifact does not otherwise say which model wrote it, so a stage that quietly
 to a weaker model is indistinguishable from one that did not — which matters most on
 exactly the stages where weak models degrade quietly.
 
+### Validation status
+
+The runner is exercised end to end, not just dry-run: a stage executes a real model
+call, and a failing primary falls through to a different provider **and** a different
+runner, with both attempts recorded:
+
+```
+  1/2  dead-gateway/some-local-model   rc=1  FAILED
+  2/2  anthropic/claude-sonnet-5       rc=0  OK
+```
+
+What is **not** yet validated: a full nine-stage run start to finish, and the `pi` and
+`opencode` runners against live endpoints (their argument construction is verified, their
+model calls are not). Treat those as untested paths.
+
 ### Where model quality actually matters
 
 Learned from running this pipeline, not assumed:
