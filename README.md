@@ -89,14 +89,30 @@ stages:
 
 Two runners, because they reach different things:
 
-| | `claude` | `opencode` |
-|---|---|---|
-| API shape | Anthropic (`/v1/messages`) | **OpenAI-compatible** + many providers |
-| skills / personas | native | via skill autodiscovery |
-| fallback chain | native, same provider only | handled by this repo's runner |
+| | `claude` | `opencode` | `pi` |
+|---|---|---|---|
+| API shape | Anthropic (`/v1/messages`) | OpenAI-compatible | OpenAI / Anthropic / Google |
+| provider selection | none — endpoint only | folded into `provider/model` | **separate `--provider` flag** |
+| credential | env var | env var | **`--api-key` flag** |
+| skills / personas | native | via skill autodiscovery | its own extension system |
+| fallback chain | native, same provider only | handled by this repo's runner | handled by this repo's runner |
 
-Anything OpenAI-compatible works through `opencode` — LiteLLM, vLLM, Ollama,
-OpenRouter, a vendor API. A gateway that speaks both shapes can serve either runner.
+Anything OpenAI-compatible works through `opencode` or `pi` — LiteLLM, vLLM, Ollama,
+OpenRouter, a vendor API.
+
+[`pi`](https://github.com/earendil-works/pi) is the cleanest fit of the three: it takes
+provider, model and key as separate flags rather than requiring env-var juggling, and
+`--mode json` is genuinely non-interactive. Install it either way:
+
+```bash
+npm i -g @earendil-works/pi-coding-agent        # simplest; provides `pi`
+git submodule update --init vendor/pi           # pinned source, if you'd rather build it
+```
+
+`vendor/pi` is a submodule pinned to a reviewed commit. It is **not required** to run the
+pipeline — the npm package provides the same binary. Pin it when you want the source under
+review (their own supply-chain posture is worth matching), or when you want their
+`pi-ai` and `pi-evals` packages for work beyond the runner.
 
 Endpoints and keys are read from **environment variables named in the config**, never
 stored in it, so `models.yaml` never contains a URL or secret.

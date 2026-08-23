@@ -85,13 +85,20 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
     if not shutil.which(cmd_name):
         raise FileNotFoundError(cmd_name)
 
-    # Only claude consumes --fallback-model; for opencode the runner loop handles it.
+    # Only claude consumes --fallback-model; every other runner relies on the
+    # loop below for fallback.
     fallback_arg = ",".join(same_provider_fallbacks) if same_provider_fallbacks else attempt["model"]
+
+    # A runner that takes the provider as its own argument (pi does) names it
+    # here; otherwise {provider} expands to the provider's `remote` name or the
+    # config key, which is what runners expecting "provider/model" need.
+    provider_arg = provider.get("remote", provider_name)
 
     argv = [cmd_name]
     for raw in runner.get("args", []):
         argv.append(
             raw.replace("{model}", attempt["model"])
+               .replace("{provider}", provider_arg)
                .replace("{fallback}", fallback_arg)
                .replace("{prompt_file}", str(prompt_file))
         )
@@ -103,7 +110,7 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
     if base_url_env:
         value = os.environ.get(base_url_env)
         if value:
-            env["ANTHROPIC_BASE_URL" if runner_name == "claude" else "OPENAI_BASE_URL"] = value
+            env[runner.get("base_url_var", "OPENAI_BASE_URL")] = value
         elif base_url_env != "ANTHROPIC_BASE_URL":
             # An explicitly configured custom endpoint that is unset is a
             # misconfiguration, not a silent fall-through to the vendor default.
@@ -116,13 +123,13 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
     if key_env:
         value = os.environ.get(key_env)
         if value:
-            env["ANTHROPIC_API_KEY" if runner_name == "claude" else "OPENAI_API_KEY"] = value
+            env[runner.get("api_key_var", "OPENAI_API_KEY")] = value
         else:
             # Claude Code can be authenticated by OAuth, in which case no API key
             # exists and demanding one would block a perfectly working setup. Every
             # other runner talks to an endpoint that genuinely needs a credential.
             msg = f"provider '{provider_name}': ${key_env} is not set"
-            if runner_name == "claude":
+            if runner.get("auth_optional"):
                 print(f"  note: {msg}; relying on the CLI's own auth", file=sys.stderr)
             elif strict:
                 sys.exit(msg)

@@ -9,21 +9,34 @@
 #
 #   claude    - Anthropic message shape (/v1/messages). Skills and agent personas are
 #               native. Has a built-in fallback chain (--fallback-model a,b,c) but only
-#               within one provider.
+#               within one provider. Authenticates by OAuth, so it may have no API key.
 #   opencode  - OpenAI-compatible (/v1/chat/completions) and every provider the Vercel AI
 #               SDK supports. This is what lets you point a stage at a local model, a
 #               LiteLLM gateway, or any OpenAI-compatible vendor.
+#   pi        - earendil-works/pi. Takes provider, model and key as separate flags, so it
+#               needs no env-var juggling, and `--mode json` is properly non-interactive.
+#               Install: npm i -g @earendil-works/pi-coding-agent  (bin: `pi`)
 #
 # A gateway that speaks both shapes (LiteLLM does) can serve either runner.
 
 runners:
   claude:
     cmd: claude
-    # Non-interactive invocation. {model}/{fallback}/{prompt_file} are substituted.
+    # Non-interactive invocation. {model}/{provider}/{fallback}/{prompt_file} substitute.
     args: ["-p", "--model", "{model}", "--fallback-model", "{fallback}"]
+    base_url_var: ANTHROPIC_BASE_URL
+    api_key_var: ANTHROPIC_API_KEY
+    # Claude Code can authenticate by OAuth, so a missing API key is not an error.
+    auth_optional: true
   opencode:
     cmd: opencode
     args: ["run", "-m", "{model}", "--format", "json"]
+  pi:
+    cmd: pi
+    # pi separates provider from model, which the other two conflate or omit.
+    args: ["--provider", "{provider}", "--model", "{model}", "--mode", "json", "--no-session"]
+    base_url_var: OPENAI_BASE_URL
+    api_key_var: OPENAI_API_KEY
 
 providers:
   # Anthropic direct. The default, and the only one enabled out of the box.
@@ -47,6 +60,25 @@ providers:
   #   runner: opencode
   #   api_key_env: MCP_BUILDER_LOCAL_KEY
   #   base_url_env: MCP_BUILDER_LOCAL_URL
+  #
+  # --- pi examples. `remote` is the provider name pi itself knows; the key here
+  # --- is just what you call it in this file.
+  #
+  # pi-anthropic:
+  #   runner: pi
+  #   remote: anthropic
+  #   api_key_env: ANTHROPIC_API_KEY
+  #
+  # pi-google:
+  #   runner: pi
+  #   remote: google
+  #   api_key_env: GEMINI_API_KEY
+  #
+  # pi-gateway:
+  #   runner: pi
+  #   remote: openai
+  #   api_key_env: MCP_BUILDER_GATEWAY_KEY
+  #   base_url_env: MCP_BUILDER_GATEWAY_URL
 
 # Applied to any stage that does not override them.
 defaults:
