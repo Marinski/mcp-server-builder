@@ -34,6 +34,8 @@ runners:
     # versions (modelcontextprotocol.io tends to pass; npmjs / raw.githubusercontent do
     # not). Verified fix: append per-domain allow rules to the args above, e.g.
     #   "--allowedTools", "WebFetch(domain:registry.npmjs.org)", "--allowedTools", "WebFetch(domain:raw.githubusercontent.com)"
+    # Stage 3 also fetches github.com (the reference server's protocol-feature list, which
+    # sources its §4 checklist), so add "WebFetch(domain:github.com)" too.
     # or put the same rules in the target repo's .claude/settings.json permissions.allow.
     base_url_var: ANTHROPIC_BASE_URL
     api_key_var: ANTHROPIC_API_KEY

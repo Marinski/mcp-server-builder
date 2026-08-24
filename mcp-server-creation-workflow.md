@@ -243,6 +243,10 @@ STEP 1 — Ground yourself in the current spec. Fetch and read:
   The protocol spec describes what a compliant server may do; it does not describe what a
   specific SDK's helper actually implements. One run's ADR assumed cursor-based pagination that
   the installed SDK did not support.
+- https://github.com/modelcontextprotocol/servers/blob/main/src/everything/docs/features.md —
+  the reference "everything" server's own list of what the protocol offers beyond tools. Use it
+  as the source for STEP 3 §4's checklist rows, and verify every method name it gives against
+  the revision you fetched: that file tracks the reference server, not the spec.
 Record in your output: spec revision date, SDK name and version.
 If anything below contradicts the current spec, the spec wins — flag the conflict explicitly.
 
@@ -265,7 +269,34 @@ STEP 3 — Write {{DOCS}}/03-mcp-surface.md as an ADR containing:
    State the trade-off in terms of model accuracy vs tool-list token cost. Target a count you
    name and justify. If >20 tools, justify why the model will still choose correctly.
 
-4. Tool catalog. For each tool:
+4. Protocol feature checklist. The protocol is far wider than tools, and a surface designed
+   without looking at the rest of it defaults to tools-only. For EVERY row below write
+   **applies / does not apply, because…**. "Does not apply" is a fine answer — most rows will be
+   — but it has to be a decision, not an omission. Cite capability IDs wherever a row applies.
+
+   | Feature | Methods involved | The decision it forces |
+   |---|---|---|
+   | Tasks (SEP-1686) | `tools/call` with `task: true` → `taskId`, then `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel` | which tools are long-running |
+   | Elicitation | `elicitation/create` | which tools need input or confirmation mid-call |
+   | Progress | `notifications/progress` (only when the client sent a `progressToken`) | which tools report progress while working |
+   | Resource subscriptions | `resources/subscribe`, `resources/unsubscribe`, `notifications/resources/updated` | which resources change while a session is open |
+   | Argument completions | completion requests on prompt and resource-template arguments | which arguments have a knowable value set |
+   | Sampling | `sampling/createMessage` | does the server need the client's model |
+   | Roots | the client-provided root list | does the server need the client's filesystem scope |
+   | Logging | `logging/setLevel` | does the client control log verbosity |
+
+   The tasks row is the one most often got wrong. Any tool whose work can exceed a client's
+   request timeout — a container build, a backtest, a pipeline run, a bulk export — is a task,
+   not a blocking call. Name the wall-clock threshold you are designing against and say where
+   the number came from. Returning a job id the model must poll with a *second* tool is the
+   pre-tasks workaround: if the revision you fetched supports tasks, prefer them and say so;
+   if you keep the two-tool shape anyway, say why.
+
+   Every feature is optional for the *client* too, so for each row marked "applies", state what
+   the server does when the connected client did not declare that capability. Each "applies" row
+   becomes a declared capability in the initialize handshake and a required L2 test in Stage 6.
+
+5. Tool catalog. For each tool:
    - name (verb_noun, snake_case, prefixed if collision-prone)
    - description written FOR THE MODEL: when to use it, when NOT to, what it does not do
    - input JSON Schema sketch, with per-field descriptions, enums, and constraints
@@ -273,32 +304,37 @@ STEP 3 — Write {{DOCS}}/03-mcp-surface.md as an ADR containing:
    - annotations/hints: read-only, destructive, idempotent, open-world. Check the field
      names against the revision you fetched, and note that clients treat annotations as
      UNTRUSTED — they are a hint to the host, never an enforcement mechanism.
-   - confirmation required? (yes/no) and what the confirmation must display. Confirmation
-     is **not a server-side protocol capability** in any revision published so far: it is
-     an obligation on the client. Say what the server does to make the side effect
-     impossible without confirmation, because declaring an annotation does not.
+   - confirmation required? (yes/no), what the confirmation must display, and **by which
+     mechanism**. A `destructive` annotation is a hint the client may ignore, so it is never
+     itself the gate. Two mechanisms actually are: `elicitation/create`, where the server asks
+     before it acts and refuses when the answer is no — cleaner than returning an error that
+     merely asks the model to ask, and it survives a model that does not; or a server-side
+     precondition the caller cannot skip (a token from a prior read, a dry-run result echoed
+     back). Say which, and say what happens when the client declared no elicitation capability
+     — for a destructive tool that answer must be "refuse", never "proceed unconfirmed".
    - errors: which failures are tool-level results the model can recover from vs protocol errors
    - source capability ID(s)
 
-5. Resource catalog. URI scheme, templates and their parameters, MIME types, whether the list is
+6. Resource catalog. URI scheme, templates and their parameters, MIME types, whether the list is
    static or dynamic, subscription/update behaviour if any.
 
-6. Prompt catalog (may be empty — say so if so).
+7. Prompt catalog (may be empty — say so if so).
 
-7. Cross-cutting design:
+8. Cross-cutting design:
    - transport(s): {{TRANSPORT}}, and the consequences (e.g. on stdio, nothing may be written to
      stdout except protocol frames — all logging goes to stderr or the logging capability)
    - auth & secrets: where credentials come from, what is never accepted as a tool argument
    - scoping/multi-account: how a call selects the target account/workspace
    - pagination for anything unbounded; hard caps on result size
-   - rate limiting, timeouts, retries
+   - rate limiting, timeouts, retries — anything that can outlast a client's request timeout
+     belongs in §4's tasks row, not here
    - statefulness: what the server holds between calls, and what happens on reconnect
    - versioning: how the tool surface evolves without breaking clients
    - observability: what gets logged, and how logs stay out of the transport
 
-8. Rejected alternatives — at least two, with why.
+9. Rejected alternatives — at least two, with why.
 
-9. Risks and open questions, numbered.
+10. Risks and open questions, numbered.
 
 Rules:
 - No implementation code. Schemas as sketches, not final source.
@@ -307,7 +343,7 @@ Rules:
 ```
 
 **Human gate:** read this document yourself before continuing. It is the cheapest place to change
-your mind. Answer §9 inline in the file.
+your mind. Answer §10 inline in the file.
 
 > **Expect to find defects in the wrapped product.** Deciding what an autonomous caller may
 > do forces a harder look at the authorization model than feature work ever does, so stages
@@ -473,12 +509,31 @@ L2 Protocol — start the server over {{TRANSPORT}} and assert:
    - a tool error returns a recoverable tool result, not a transport crash
    - unknown tool name, malformed args, and oversized results all degrade gracefully
    - on stdio: stdout carries protocol frames ONLY (assert this explicitly)
+   - every feature §4 of 03-mcp-surface.md marked "applies": its capability appears in the
+     handshake and its methods work. For tasks, that means `tools/call` with `task: true`
+     returns a taskId, `tasks/get` reports status until `completed`, `tasks/result` returns the
+     output, and `tasks/cancel` on a working task actually stops the work. For subscriptions,
+     that a subscribed URI produces `notifications/resources/updated` and an unsubscribed one
+     stops producing them.
+   - every feature §4 marked "does not apply": its capability is NOT declared in the handshake.
+     A capability declared but unimplemented is worse than one absent — the client will use it.
 
 L3 Integration — real calls against a test instance of {{PROJECT}}, read-only tools freely,
    mutating tools against disposable data only.
 
 L4 Manual smoke — a checklist for MCP Inspector: launch command, each tool exercised once with
    sample arguments, expected result. Then a real client config and one end-to-end task.
+
+If {{SERVER}} proxies, aggregates, or gateways other MCP servers, add the reference
+"everything" server (`@modelcontextprotocol/server-everything`) as a synthetic downstream in L2
+and L3. It is the only cheap way to exercise what real downstreams will not: on demand it emits
+progress notifications, resource-update notifications for subscribed URIs, full task lifecycles,
+server-initiated elicitation and sampling requests, and argument completions. Assert each one
+survives the hop — notifications arrive at the client with the right session and URI, task ids
+round-trip through `tasks/get` and `tasks/result`, a `tasks/cancel` propagates, and an
+`elicitation/create` or `sampling/createMessage` raised downstream reaches the upstream client
+instead of being swallowed. A gateway that only ever forwards `tools/list` and `tools/call`
+passes a naive suite and drops all of that silently.
 
 Also add: a test that every tool's description is non-empty and mentions when NOT to use it,
 and a snapshot test on the tool list so surface changes are never silent.
@@ -633,7 +688,11 @@ Then write the revised prompt text back into
    nothing; a tool the model misuses costs you trust.
 5. **Demand pasted command output** at every verification point. "Tests pass" without output is
    not evidence.
-6. **Never run two fix-applying agents concurrently against the same working tree**, in any
+6. **The protocol is wider than tools.** Tasks, elicitation, progress, subscriptions,
+   completions, sampling and roots are each the right answer to some capability, and a surface
+   designed without deciding on them defaults to tools-only. Stage 3 §4 forces the decision;
+   Stage 6 tests both the yeses and the noes.
+7. **Never run two fix-applying agents concurrently against the same working tree**, in any
    stage. Concurrent agents are only safe when every one of them is read-only, or each is scoped
    to a disjoint, isolated tree. Two agents both able to write against the same tree at once is
    how a run loses track of what actually changed.
