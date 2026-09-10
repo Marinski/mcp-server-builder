@@ -19,6 +19,28 @@ SHAPE_PHASE_TRACKED = "phase-tracked"
 SHAPE_MULTI_FILE = "multi-file"
 SHAPE_NO_CHECKABLE = "no-checkable-artifact"
 
+# ── TODO (Spec 1 wiring plan, Track B items 6-7) ──────────────────────────
+# When Spec 1 merges, the runner gains an expected-artifact-shape check:
+#
+#   • Each single-file stage (1a, 1b, 2, 3, 4, 7) registers its template
+#     path (e.g. templates/01-instructions.md for stage 1a) as the
+#     expected-artifact-shape entry in the runner.  The check compares
+#     the target artifact's mtime + size against the template, computed
+#     in-memory and never persisted to disk.
+#
+#   • Stage 5 registers as directory-or-phase-based (SHAPE_PHASE_TRACKED):
+#     no single-file template match; completion is tracked per phase N/M.
+#
+#   • Stage 9 is EXPLICITLY EXEMPT from the artifact-path check and must
+#     never receive a docs/mcp/09-retro.md template.  Stage 9 patches
+#     this repo's own workflow file (mcp-server-creation-workflow.md),
+#     not a target project's docs/mcp/ — so a naive per-stage template
+#     check would either false-positive or force a wrong template.
+#     SHAPE_NO_CHECKABLE is its permanent shape.
+#
+# Until Spec 1 merges this is a documentation-only no-op.
+# ───────────────────────────────────────────────────────────────────────────
+
 # Each key is a stage ID. Values are dicts with:
 #   artifact_shape    – one of the SHAPE_* constants
 #   preflight_inputs  – exact filenames the stage must find on disk before it runs
