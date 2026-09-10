@@ -20,9 +20,11 @@ supposed to read and write.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -68,10 +70,163 @@ def build_outputs(stage: str, docs: Path | None) -> list[dict]:
     return outputs
 
 
+def preflight_check(stage: str, docs: Path | None,
+                    phase: str | None = None,
+                    manifest_path: Path | None = None) -> None:
+    """Verify required input artifacts exist on disk before spawning a subprocess.
+
+    Stage 9 requires no pre-flight check.
+    Stage 5 additionally validates --phase N/M and M consistency.
+    """
+    if stage == "9":
+        return
+    if docs is None:
+        return
+
+    from stage_contract import STAGE_CONTRACT  # type: ignore[import]
+
+    contract = STAGE_CONTRACT.get(stage)
+    if contract is None:
+        return
+
+    missing = [f for f in contract["preflight_inputs"]
+               if not (docs / f).is_file()]
+    if missing:
+        sys.exit(f"pre-flight: missing input(s) for stage {stage}: "
+                 + ", ".join(str(docs / f) for f in missing))
+
+    if stage == "5":
+        if not phase:
+            sys.exit("pre-flight: stage 5 requires --phase N/M")
+        m = re.fullmatch(r"(\d+)/(\d+)", phase)
+        if not m:
+            sys.exit(f"pre-flight: --phase must be N/M format, got '{phase}'")
+        n, phase_total = int(m.group(1)), int(m.group(2))
+        if n < 1 or n > phase_total:
+            sys.exit(f"pre-flight: phase {n}/{phase_total} is out of range")
+        # Verify M is consistent with prior stage-5 manifest entries.
+        if manifest_path and manifest_path.is_file():
+            for line in manifest_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (rec.get("stage") == "5"
+                        and rec.get("phase")
+                        and rec.get("ok")):
+                    prev_m = int(rec["phase"].split("/")[1])
+                    if prev_m != phase_total:
+                        sys.exit(
+                            f"pre-flight: --phase M={phase_total} inconsistent "
+                            f"with prior stage-5 manifest entry M={prev_m}")
+
+
+def postflight_check(stage: str, docs: Path | None,
+                     outputs: list[dict]) -> list[dict]:
+    """After a successful run, record exists/size/mtime for tracked output paths.
+
+    Stage 5: skip existence check (completion = ok attempt for phase N/M).
+    Stage 9: skip entirely (returns empty).
+    """
+    if stage == "9" or docs is None:
+        return outputs
+
+    from stage_contract import STAGE_CONTRACT  # type: ignore[import]
+
+    contract = STAGE_CONTRACT.get(stage)
+    if contract is None:
+        return outputs
+
+    if stage == "5":
+        return outputs  # skip existence check per spec
+
+    result: list[dict] = []
+    for filename in contract.get("postflight_outputs", []):
+        fpath = docs / filename
+        exists = fpath.is_file()
+        result.append({
+            "path": str(fpath),
+            "shape": contract["artifact_shape"],
+            "exists": exists,
+            "size": fpath.stat().st_size if exists else 0,
+            "mtime": fpath.stat().st_mtime if exists else 0.0,
+        })
+    return result
+
+
+class LogCapture:
+    """Tee stdout+stderr to a log file while streaming to console.
+
+    Records the last ~50 lines as output_tail for the manifest.
+    Used as a context manager: returns (log_path_str, output_tail_str).
+    Falls back to (None, None) when --docs is not given.
+    """
+
+    TAIL_LINES = 50
+
+    def __init__(self, stage: str, docs: Path | None,
+                 phase: str | None = None) -> None:
+        self.stage = stage
+        self.docs = docs
+        self.phase = phase
+        self._fh = None
+        self._log_path = None
+        self._tail_lines: list[str] = []
+
+    def __enter__(self):
+        if self.docs is None:
+            return None, None
+        ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        log_dir = self.docs / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{self.stage}"
+        if self.phase:
+            name += f"-phase{self.phase.split('/')[0]}"
+        name += f"-{ts}.log"
+        self._log_path = str(log_dir / name)
+        self._fh = open(self._log_path, "w", encoding="utf-8")
+        return self._log_path, self
+
+    def write(self, text: str) -> None:
+        """Write text to both console (stderr) and log file."""
+        sys.stderr.write(text)
+        sys.stderr.flush()
+        if self._fh:
+            self._fh.write(text)
+            self._fh.flush()
+        for line in text.splitlines(keepends=True):
+            self._tail_lines.append(line)
+            if len(self._tail_lines) > self.TAIL_LINES:
+                self._tail_lines.pop(0)
+
+    def tail(self) -> str:
+        return "".join(self._tail_lines).strip()
+
+    def __exit__(self, *exc_info):
+        if self._fh:
+            self._fh.close()
+            self._fh = None
+
+
 def load_config(path: Path) -> dict:
     if not path.exists():
         sys.exit(f"no config at {path}\nCopy models.example.yaml to models.yaml and edit it.")
     return yaml.safe_load(path.read_text())
+
+
+DEFAULT_TIMEOUT = 1800
+
+
+def resolve_timeout(cfg: dict, stage: str, cli_timeout: int | None) -> int:
+    """Resolve subprocess timeout: CLI flag > per-stage models.yaml > default."""
+    if cli_timeout is not None:
+        return cli_timeout
+    override = (cfg.get("stages") or {}).get(stage) or {}
+    if "timeout" in override:
+        return int(override["timeout"])
+    return DEFAULT_TIMEOUT
 
 
 def resolve_chain(cfg: dict, stage: str) -> list[dict]:
@@ -181,7 +336,8 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
                     *, duration_s: float, timed_out: bool,
                     phase: str | None = None,
                     outputs: list[dict] | None = None,
-                    log_path: str | None = None) -> None:
+                    log_path: str | None = None,
+                    output_tail: str | None = None) -> None:
     """Append what actually ran to a manifest.
 
     An artifact does not record which model produced it, so a run is otherwise
@@ -196,6 +352,7 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
       phase        – 'N/M' string, stage 5 only
       outputs      – [{path, shape, exists, size, mtime}], empty array for stage 9
       log_path     – path to the tee'd log file (if given)
+      output_tail  – last ~50 lines of stdout+stderr (if captured)
     """
     path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
     if path is None:
@@ -214,6 +371,7 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
         "phase": phase,
         "outputs": outputs if outputs is not None else [],
         "log_path": log_path,
+        "output_tail": output_tail,
     }
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record) + "\n")
@@ -239,13 +397,20 @@ def main() -> int:
                     help="append a record of what actually ran to this JSONL file "
                          "(default: <docs>/run-manifest.jsonl when --docs is given)")
     ap.add_argument("--phase", type=str, default=None,
-                    help="phase tracking string 'N/M' (stage 5 only, e.g. '2/5')")
+                     help="phase tracking string 'N/M' (stage 5 only, e.g. '2/5')")
     ap.add_argument("--log-path", type=str, default=None,
-                    help="path to the tee'd log file for this run")
+                     help="path to the tee'd log file for this run")
+    ap.add_argument("--timeout", type=int, default=None,
+                     help=f"subprocess timeout in seconds (default: {DEFAULT_TIMEOUT})")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     chain = resolve_chain(cfg, args.stage)
+    timeout_s = resolve_timeout(cfg, args.stage, args.timeout)
+
+    # Pre-flight: verify required input artifacts exist before spawning anything.
+    mf_path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
+    preflight_check(args.stage, args.docs, args.phase, mf_path)
 
     cwd = args.cwd or (args.docs.resolve().parent.parent if args.docs else None)
     if cwd is not None:
@@ -262,7 +427,8 @@ def main() -> int:
     print(f"stage {args.stage}"
           + (f"  agent={agent}" if agent else "")
           + (f"  docs={args.docs}" if args.docs else "")
-          + (f"  cwd={cwd}" if cwd else ""), file=sys.stderr)
+          + (f"  cwd={cwd}" if cwd else "")
+          + (f"  timeout={timeout_s}s" if timeout_s else ""), file=sys.stderr)
     print("  chain: " + " -> ".join(f"{c['provider']}/{c['model']}" for c in chain), file=sys.stderr)
 
     # Absolute, because the child process may run in a different working directory.
@@ -292,23 +458,47 @@ def main() -> int:
         stdin = prompt_file.open() if args.prompt else subprocess.DEVNULL
         timed_out = False
         t_start = time.monotonic()
-        try:
-            result = subprocess.run(argv, env=env, stdin=stdin, cwd=cwd)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            result = subprocess.CompletedProcess(argv, returncode=-1)
-        finally:
-            if args.prompt:
-                stdin.close()
-        duration_s = time.monotonic() - t_start
-        record_attempt(args, attempt, i, len(chain), result.returncode,
+        log_path = None
+        output_tail = None
+        with LogCapture(args.stage, args.docs, args.phase) as (lp, lc):
+            log_path = lp
+            try:
+                proc = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, env=env, cwd=cwd)
+            except FileNotFoundError as exc:
+                if args.prompt:
+                    stdin.close()
+                print(f"  skip {label}: '{exc}' not on PATH", file=sys.stderr)
+                continue
+            try:
+                for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    if lc is not None:
+                        lc.write(line)
+                    else:
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
+                proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()
+                proc.wait()
+                if lc is not None:
+                    lc.write("\n")
+            finally:
+                if args.prompt:
+                    stdin.close()
+            duration_s = time.monotonic() - t_start
+            tail = lc.tail() if lc is not None else None
+        postflight = postflight_check(args.stage, args.docs, outputs)
+        record_attempt(args, attempt, i, len(chain), proc.returncode,
                         duration_s=duration_s, timed_out=timed_out,
-                        phase=args.phase, outputs=outputs,
-                        log_path=args.log_path)
-        if result.returncode == 0:
+                        phase=args.phase, outputs=postflight,
+                        log_path=log_path, output_tail=tail)
+        if proc.returncode == 0:
             print(f"  ok: {label}", file=sys.stderr)
             return 0
-        print(f"  failed ({result.returncode}): {label}", file=sys.stderr)
+        print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
 
     if args.dry_run:
         return 0
