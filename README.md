@@ -164,6 +164,10 @@ runner, with both attempts recorded:
   2/2  anthropic/claude-sonnet-5       rc=0  OK
 ```
 
+Templates now exist for all 9 stages (see [`templates/`](templates/)), providing
+skeleton artifacts the agents fill in. This does **not** substitute for actually running
+any of stages 1a, 1b, 4, 5, 6, 8, or 9 — templates are outlines, not validations.
+
 What is **not** yet validated: a full nine-stage run start to finish, and the `pi` and
 `opencode` runners against live endpoints (their argument construction is verified, their
 model calls are not). Treat those as untested paths.
