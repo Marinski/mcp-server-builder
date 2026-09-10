@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -34,6 +35,37 @@ except ImportError:
     sys.exit("PyYAML required: pip install pyyaml")
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def build_outputs(stage: str, docs: Path | None) -> list[dict]:
+    """Collect per-file shape metadata for the artifact-shape table.
+
+    Returns a list of objects, one per tracked output file:
+        {path, shape, exists, size, mtime}
+
+    Empty array for stage 9 (no-checkable-artifact) and when --docs is not given.
+    """
+    # Import here to avoid circular imports; matches the existing pattern.
+    from stage_contract import STAGE_CONTRACT, SHAPE_NO_CHECKABLE  # type: ignore[import]
+
+    contract = STAGE_CONTRACT.get(stage)
+    if contract is None or contract["artifact_shape"] == SHAPE_NO_CHECKABLE:
+        return []
+
+    outputs: list[dict] = []
+    for filename in contract.get("postflight_outputs", []):
+        if docs is None:
+            continue
+        fpath = docs / filename
+        exists = fpath.is_file()
+        outputs.append({
+            "path": str(fpath) if docs else filename,
+            "shape": contract["artifact_shape"],
+            "exists": exists,
+            "size": fpath.stat().st_size if exists else 0,
+            "mtime": fpath.stat().st_mtime if exists else 0.0,
+        })
+    return outputs
 
 
 def load_config(path: Path) -> dict:
@@ -145,7 +177,11 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
     return argv, env
 
 
-def record_attempt(args, attempt: dict, index: int, total: int, returncode: int) -> None:
+def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
+                    *, duration_s: float, timed_out: bool,
+                    phase: str | None = None,
+                    outputs: list[dict] | None = None,
+                    log_path: str | None = None) -> None:
     """Append what actually ran to a manifest.
 
     An artifact does not record which model produced it, so a run is otherwise
@@ -153,21 +189,34 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int)
     model looks identical to one that did not. The manifest is what lets a later
     reader tell the difference, and what makes a bad artifact traceable to a
     routing decision rather than to the prompt.
+
+    New fields per spec §3:
+      duration_s   – wall-clock seconds for the subprocess
+      timed_out    – True when the process was killed by timeout
+      phase        – 'N/M' string, stage 5 only
+      outputs      – [{path, shape, exists, size, mtime}], empty array for stage 9
+      log_path     – path to the tee'd log file (if given)
     """
     path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
     if path is None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
+    record: dict = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "stage": args.stage,
+        "provider": attempt["provider"],
+        "model": attempt["model"],
+        "attempt": f"{index + 1}/{total}",
+        "returncode": returncode,
+        "ok": returncode == 0,
+        "duration_s": round(duration_s, 3),
+        "timed_out": timed_out,
+        "phase": phase,
+        "outputs": outputs if outputs is not None else [],
+        "log_path": log_path,
+    }
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps({
-            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "stage": args.stage,
-            "provider": attempt["provider"],
-            "model": attempt["model"],
-            "attempt": f"{index + 1}/{total}",
-            "returncode": returncode,
-            "ok": returncode == 0,
-        }) + "\n")
+        fh.write(json.dumps(record) + "\n")
 
 
 def main() -> int:
@@ -189,6 +238,10 @@ def main() -> int:
     ap.add_argument("--manifest", type=Path,
                     help="append a record of what actually ran to this JSONL file "
                          "(default: <docs>/run-manifest.jsonl when --docs is given)")
+    ap.add_argument("--phase", type=str, default=None,
+                    help="phase tracking string 'N/M' (stage 5 only, e.g. '2/5')")
+    ap.add_argument("--log-path", type=str, default=None,
+                    help="path to the tee'd log file for this run")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -215,6 +268,9 @@ def main() -> int:
     # Absolute, because the child process may run in a different working directory.
     prompt_file = args.prompt.resolve() if args.prompt else Path(os.devnull)
 
+    # Pre-compute outputs once; the same set applies to every attempt in the chain.
+    outputs = build_outputs(args.stage, args.docs)
+
     for i, attempt in enumerate(chain):
         # Models later in the chain that share this provider can be handed to
         # claude's own --fallback-model, saving a process restart.
@@ -234,12 +290,21 @@ def main() -> int:
 
         print(f"  [{i + 1}/{len(chain)}] running {label}", file=sys.stderr)
         stdin = prompt_file.open() if args.prompt else subprocess.DEVNULL
+        timed_out = False
+        t_start = time.monotonic()
         try:
             result = subprocess.run(argv, env=env, stdin=stdin, cwd=cwd)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            result = subprocess.CompletedProcess(argv, returncode=-1)
         finally:
             if args.prompt:
                 stdin.close()
-        record_attempt(args, attempt, i, len(chain), result.returncode)
+        duration_s = time.monotonic() - t_start
+        record_attempt(args, attempt, i, len(chain), result.returncode,
+                        duration_s=duration_s, timed_out=timed_out,
+                        phase=args.phase, outputs=outputs,
+                        log_path=args.log_path)
         if result.returncode == 0:
             print(f"  ok: {label}", file=sys.stderr)
             return 0
