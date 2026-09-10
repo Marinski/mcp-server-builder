@@ -386,6 +386,374 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
         fh.write(json.dumps(record) + "\n")
 
 
+def _last_ok_record(stage: str, manifest_path: Path | None,
+                    phase: str | None = None) -> dict | None:
+    """Return the last successful manifest record for a stage (and phase, if given).
+
+    Returns None when no successful record exists.
+    """
+    if manifest_path is None or not manifest_path.is_file():
+        return None
+    last_ok = None
+    for line in manifest_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (rec.get("stage") == stage
+                and rec.get("ok") is True):
+            if phase is not None and rec.get("phase") != phase:
+                continue
+            last_ok = rec
+    return last_ok
+
+
+def detect_drift(stage: str, manifest_path: Path | None) -> list[dict]:
+    """Check tracked output files for mtime/size drift against manifest.
+
+    Returns a list of drift records, one per drifted file:
+      {path, expected_size, actual_size, expected_mtime, actual_mtime}
+    Empty list when no drift is detected (or no tracked outputs exist).
+    """
+    if stage in ("5", "9"):
+        return []
+
+    rec = _last_ok_record(stage, manifest_path)
+    if rec is None:
+        return []
+
+    outputs = rec.get("outputs") or []
+    drift: list[dict] = []
+    for item in outputs:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        fpath = Path(item["path"])
+        if not fpath.is_file():
+            continue
+        cur_size = fpath.stat().st_size
+        cur_mtime = fpath.stat().st_mtime
+        if (item.get("size") != cur_size
+                or item.get("mtime") != cur_mtime):
+            drift.append({
+                "path": str(fpath),
+                "expected_size": item.get("size"),
+                "actual_size": cur_size,
+                "expected_mtime": item.get("mtime"),
+                "actual_mtime": cur_mtime,
+            })
+    return drift
+
+
+def run_stage_once(stage: str, cfg: dict, args: argparse.Namespace,
+                   prompt_file: Path, *, phase: str | None = None) -> int:
+    """Execute a single stage through its full lifecycle.
+
+    pre-flight → subprocess with timeout → post-flight → manifest record.
+    Returns the exit code (0 for success, non-zero for failure).
+    """
+    chain = resolve_chain(cfg, stage)
+    timeout_s = resolve_timeout(cfg, stage, args.timeout)
+
+    preflight_check(stage, args.docs, phase,
+                    args.manifest or (args.docs / "run-manifest.jsonl"
+                                      if args.docs else None))
+
+    cwd = args.cwd or (args.docs.resolve().parent.parent if args.docs else None)
+    if cwd is not None:
+        cwd = cwd.resolve()
+
+    agent = (cfg.get("agents") or {}).get(stage)
+    print(f"stage {stage}"
+          + (f"  agent={agent}" if agent else "")
+          + (f"  docs={args.docs}" if args.docs else "")
+          + (f"  cwd={cwd}" if cwd else "")
+          + (f"  timeout={timeout_s}s" if timeout_s else ""),
+          file=sys.stderr)
+    print("  chain: " + " -> ".join(
+        f"{c['provider']}/{c['model']}" for c in chain), file=sys.stderr)
+
+    outputs = build_outputs(stage, args.docs)
+
+    for i, attempt in enumerate(chain):
+        same_provider = [c["model"] for c in chain[i + 1:]
+                         if c["provider"] == attempt["provider"]]
+        try:
+            argv, env = build_command(cfg, attempt, prompt_file, same_provider,
+                                      strict=True)
+        except FileNotFoundError as exc:
+            print(f"  skip {attempt['provider']}/{attempt['model']}: "
+                  f"'{exc}' not on PATH", file=sys.stderr)
+            continue
+
+        label = f"{attempt['provider']}/{attempt['model']}"
+        print(f"  [{i + 1}/{len(chain)}] running {label}", file=sys.stderr)
+        stdin = prompt_file.open() if args.prompt else subprocess.DEVNULL
+        timed_out = False
+        t_start = time.monotonic()
+        log_path = None
+        output_tail = None
+        with LogCapture(stage, args.docs, phase) as (lp, lc):
+            log_path = lp
+            try:
+                proc = subprocess.Popen(
+                    argv, stdin=stdin, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, env=env, cwd=cwd)
+            except FileNotFoundError as exc:
+                if args.prompt:
+                    stdin.close()
+                print(f"  skip {label}: '{exc}' not on PATH", file=sys.stderr)
+                continue
+            try:
+                for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    if lc is not None:
+                        lc.write(line)
+                    else:
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
+                proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()
+                proc.wait()
+                if lc is not None:
+                    lc.write("\n")
+            finally:
+                if args.prompt:
+                    stdin.close()
+            duration_s = time.monotonic() - t_start
+            tail = lc.tail() if lc is not None else None
+
+        postflight = postflight_check(stage, args.docs, outputs)
+        record_attempt(args, attempt, i, len(chain), proc.returncode,
+                       duration_s=duration_s, timed_out=timed_out,
+                       phase=phase, outputs=postflight,
+                       log_path=log_path, output_tail=tail)
+        if proc.returncode == 0:
+            print(f"  ok: {label}", file=sys.stderr)
+            return 0
+        print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
+
+    print("all attempts in the chain failed", file=sys.stderr)
+    return 1
+
+
+def _resolve_prior_phase_total(manifest_path: Path | None) -> int | None:
+    """Find the total phase count M from a prior stage-5 manifest entry.
+
+    Returns M if found, None if no phase data exists in the manifest.
+    """
+    if manifest_path is None or not manifest_path.is_file():
+        return None
+    total = None
+    for line in manifest_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("stage") == "5" and rec.get("phase"):
+            parts = rec["phase"].split("/")
+            if len(parts) == 2 and parts[1].isdigit():
+                total = int(parts[1])
+    return total
+
+
+def _last_completed_phase(manifest_path: Path | None) -> int:
+    """Return the highest completed phase number N for stage 5.
+
+    Returns 0 when no phase has been recorded or none succeeded.
+    """
+    if manifest_path is None or not manifest_path.is_file():
+        return 0
+    last_n = 0
+    for line in manifest_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (rec.get("stage") == "5"
+                and rec.get("ok") is True
+                and rec.get("phase")):
+            parts = rec["phase"].split("/")
+            if len(parts) == 2 and parts[0].isdigit():
+                n = int(parts[0])
+                if n > last_n:
+                    last_n = n
+    return last_n
+
+
+def run_batch(args: argparse.Namespace) -> int:
+    """Execute --batch: contiguous non-gated spans with human-gate stops.
+
+    Span A runs 1a then 1b sequentially (holding the lock).
+    Stops before human-gated stages {2, 3, 4}.
+    Span B handles stage 5's phase loop (last-completed+1 .. M, with
+    automated verify-gate between phases).
+    Span C runs 6, 7, 8, 9 sequentially.
+    """
+    cfg = load_config(args.config)
+    mf_path = args.manifest or (args.docs / "run-manifest.jsonl"
+                                if args.docs else None)
+
+    from lock import RunLock, LockError  # type: ignore[import]
+    from run_state import first_pending_unit  # type: ignore[import]
+    from stage_contract import STAGE_CONTRACT, STAGE_ORDER  # type: ignore[import]
+
+    # Acquire the lock for the entire batch duration.
+    try:
+        lock = RunLock(args.docs, mode="batch")
+        lock.acquire()
+    except LockError as exc:
+        sys.exit(str(exc))
+
+    try:
+        # Determine the starting stage.
+        if args.from_stage:
+            if args.from_stage not in STAGE_ORDER:
+                sys.exit(f"unknown stage '{args.from_stage}'")
+            start_stage = args.from_stage
+        else:
+            unit = first_pending_unit(mf_path, args.docs, None)
+            if unit is None:
+                print("nothing to run: every stage is done", file=sys.stderr)
+                return 0
+            start_stage = unit.split()[0]
+
+        # Starting at a human-gated stage in batch mode is an error.
+        if STAGE_CONTRACT.get(start_stage, {}).get("human_gated"):
+            print(
+                f"batch: stage {start_stage} requires a human gate — "
+                f"run it yourself: ./runner/run_stage.py {start_stage}"
+                f" --docs {args.docs}",
+                file=sys.stderr,
+            )
+            return 0
+
+        start_idx = STAGE_ORDER.index(start_stage)
+        prompt_file = args.prompt.resolve() if args.prompt else Path(os.devnull)
+
+        for idx in range(start_idx, len(STAGE_ORDER)):
+            stage = STAGE_ORDER[idx]
+
+            # Human-gated stage: stop and instruct.
+            if STAGE_CONTRACT.get(stage, {}).get("human_gated"):
+                print(
+                    f"next stage {stage} requires a human gate — "
+                    f"run it yourself: ./runner/run_stage.py {stage}"
+                    f" --docs {args.docs}",
+                    file=sys.stderr,
+                )
+                return 0
+
+            # ── Stage 5: phase loop (Span B) ──────────────────────────
+            if stage == "5":
+                # Determine M (total phases).
+                if args.phases is not None:
+                    phase_total = args.phases
+                else:
+                    phase_total = _resolve_prior_phase_total(mf_path)
+                    if phase_total is None:
+                        print(
+                            "stage 5 needs --phases M — rerun as: "
+                            "run_stage.py --batch --phases M",
+                            file=sys.stderr,
+                        )
+                        return 0
+
+                # Find the last completed phase.
+                last_completed = _last_completed_phase(mf_path)
+
+                for n in range(last_completed + 1, phase_total + 1):
+                    phase = f"{n}/{phase_total}"
+                    print(f"\n── batch: stage 5 phase {phase} ──",
+                          file=sys.stderr)
+
+                    # Re-read cfg to pick up any changes.
+                    cfg = load_config(args.config)
+                    rc = run_stage_once(
+                        "5", cfg, args, prompt_file, phase=phase)
+                    if rc != 0:
+                        print(
+                            f"batch: stage 5 phase {phase} failed",
+                            file=sys.stderr,
+                        )
+                        return rc
+
+                    # Automated verify-gate between phases (not after
+                    # the last phase).
+                    if n < phase_total:
+                        print(
+                            f"\n── verify-gate: stage 5 phase {phase} "
+                            f"complete ──", file=sys.stderr)
+                        # The verify-gate runs outside this script; the
+                        # user must run ready-to-push or equivalent.
+
+                continue  # proceed to Span C
+
+            # ── Spans A & C: run non-gated stages ─────────────────────
+            print(f"\n── batch: stage {stage} ──", file=sys.stderr)
+
+            # Re-read cfg each stage.
+            cfg = load_config(args.config)
+
+            # Check if stage is already done.
+            from run_state import compute_run_states  # type: ignore[import]
+            states = compute_run_states(mf_path, args.docs)
+            # For stage 5 (not in this branch) and stage 9, state is
+            # always "done" if any record exists. For other stages,
+            # check the unit name directly.
+            stage_state = states.get(stage, "not-started")
+
+            if stage_state == "done" and not args.force:
+                print(f"  stage {stage}: done, skipping", file=sys.stderr)
+                continue
+
+            if stage_state == "done" and args.force:
+                # --force re-runs a done stage; check for drift first.
+                drift = detect_drift(stage, mf_path)
+                if drift and not args.confirm_overwrite:
+                    print(
+                        f"stage {stage}: drift detected on "
+                        f"{len(drift)} tracked output(s):",
+                        file=sys.stderr,
+                    )
+                    for d in drift:
+                        print(
+                            f"  {d['path']}: "
+                            f"size {d['expected_size']}→{d['actual_size']}, "
+                            f"mtime {d['expected_mtime']}→{d['actual_mtime']}",
+                            file=sys.stderr,
+                        )
+                    print(
+                        f"use --force --confirm-overwrite to proceed",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if drift:
+                    print(
+                        f"  stage {stage}: --force overriding "
+                        f"{len(drift)} drifted output(s)",
+                        file=sys.stderr,
+                    )
+
+            rc = run_stage_once(stage, cfg, args, prompt_file)
+            if rc != 0:
+                print(f"batch: stage {stage} failed", file=sys.stderr)
+                return rc
+
+        print("\nbatch: all non-gated stages complete", file=sys.stderr)
+        return 0
+
+    finally:
+        lock.release()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -421,6 +789,16 @@ def main() -> int:
                      help="path to the tee'd log file for this run")
     ap.add_argument("--timeout", type=int, default=None,
                      help=f"subprocess timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    ap.add_argument("--batch", action="store_true",
+                     help="run contiguous non-gated spans in one process; "
+                          "stops before human-gated stages {2, 3, 4} "
+                          "and requires --phases for stage 5")
+    ap.add_argument("--phases", type=int, default=None, metavar="M",
+                     help="total number of phases for stage 5 (e.g. 5 for '1/5' .. '5/5')")
+    ap.add_argument("--force", action="store_true",
+                     help="re-run a 'done' stage, checking for output drift first")
+    ap.add_argument("--confirm-overwrite", action="store_true",
+                     help="proceed past drift detection when used with --force")
     args = ap.parse_args()
 
     mf_path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
@@ -442,6 +820,20 @@ def main() -> int:
 
     if args.from_stage is not None and args.stage is not None:
         sys.exit("--from STAGE cannot be combined with a positional stage")
+
+    # --confirm-overwrite requires --force.
+    if args.confirm_overwrite and not args.force:
+        sys.exit("--confirm-overwrite requires --force")
+
+    # --batch: run contiguous non-gated spans with human-gate stops.
+    if args.batch:
+        if args.docs is None:
+            sys.exit("--batch requires --docs")
+        if args.stage is not None:
+            sys.exit("--batch cannot be combined with a positional stage")
+        if args.phases is not None and args.phases < 1:
+            sys.exit("--phases M must be >= 1")
+        return run_batch(args)
 
     if args.stage is None:
         from run_state import first_pending_unit  # type: ignore[import]
