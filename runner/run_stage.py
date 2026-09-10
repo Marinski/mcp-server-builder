@@ -16,6 +16,13 @@ happened to be invoked from silently sandboxes the stage out of the repo it is
 supposed to read and write.
 
   ./runner/run_stage.py 2 --docs /path/to/repo/docs/mcp --dry-run
+
+Per-stage state is computed in memory from the manifest and the artifacts on
+disk, and is never persisted to a file:
+
+  ./runner/run_stage.py --status --docs /path/to/repo/docs/mcp
+  ./runner/run_stage.py --from 3 --docs /path/to/repo/docs/mcp --dry-run
+  ./runner/run_stage.py --version
 """
 from __future__ import annotations
 
@@ -37,6 +44,8 @@ except ImportError:
     sys.exit("PyYAML required: pip install pyyaml")
 
 ROOT = Path(__file__).resolve().parent.parent
+
+VERSION = "0.1.0"
 
 
 def build_outputs(stage: str, docs: Path | None) -> list[dict]:
@@ -380,7 +389,17 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", help="stage id as used in models.yaml (1a, 1b, 2, ... 9)")
+    ap.add_argument("stage", nargs="?", default=None,
+                    help="stage id as used in models.yaml (1a, 1b, 2, ... 9); "
+                         "omit to auto-select the next stage that is not 'done'")
+    ap.add_argument("--from", dest="from_stage", default=None,
+                    help="start at this stage, skipping stages already 'done'; "
+                         "cannot be combined with a positional stage")
+    ap.add_argument("--status", action="store_true",
+                    help="print every stage's computed state and exit "
+                         "(requires --docs)")
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {VERSION}")
     ap.add_argument("--config", type=Path, default=ROOT / "models.yaml")
     ap.add_argument("--prompt", type=Path, help="file containing the stage prompt")
     ap.add_argument("--docs", type=Path,
@@ -404,12 +423,55 @@ def main() -> int:
                      help=f"subprocess timeout in seconds (default: {DEFAULT_TIMEOUT})")
     args = ap.parse_args()
 
+    mf_path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
+
+    if args.status:
+        if args.docs is None:
+            sys.exit("--status requires --docs (the manifest lives at "
+                     "<docs>/run-manifest.jsonl)")
+        from run_state import compute_run_states, live_lock_pid  # type: ignore[import]
+        states = compute_run_states(mf_path, args.docs)
+        width = max([len(u) for u in states] + [len("stage")])
+        print(f"{'stage':<{width}}  state")
+        for unit, state in states.items():
+            print(f"{unit:<{width}}  {state}")
+        lock_pid = live_lock_pid(args.docs)
+        if lock_pid is not None:
+            print(f"# run lock held by live pid {lock_pid}", file=sys.stderr)
+        return 0
+
+    if args.from_stage is not None and args.stage is not None:
+        sys.exit("--from STAGE cannot be combined with a positional stage")
+
+    if args.stage is None:
+        from run_state import first_pending_unit  # type: ignore[import]
+        try:
+            unit = first_pending_unit(mf_path, args.docs, args.from_stage)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        if unit is None:
+            print("nothing to run: every stage is done", file=sys.stderr)
+            return 0
+        args.stage = unit.split()[0]
+        if args.stage == "5":
+            parts = unit.split(maxsplit=1)
+            if len(parts) == 2:
+                detected_phase = parts[1]
+                if args.phase and args.phase != detected_phase:
+                    sys.exit(f"--phase {args.phase} conflicts with detected "
+                             f"phase {detected_phase}")
+                args.phase = detected_phase
+            elif args.phase is None:
+                sys.exit("auto-select: stage 5 has no phase info in the manifest; "
+                         "pass --phase N/M")
+        print("auto-selected stage " + args.stage
+              + (f"  phase={args.phase}" if args.phase else ""), file=sys.stderr)
+
     cfg = load_config(args.config)
     chain = resolve_chain(cfg, args.stage)
     timeout_s = resolve_timeout(cfg, args.stage, args.timeout)
 
     # Pre-flight: verify required input artifacts exist before spawning anything.
-    mf_path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
     preflight_check(args.stage, args.docs, args.phase, mf_path)
 
     cwd = args.cwd or (args.docs.resolve().parent.parent if args.docs else None)
