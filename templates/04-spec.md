@@ -30,6 +30,9 @@ Every file to be created, with its responsibility in one line.
 
 Initialisation, capability declaration, transport wiring, graceful shutdown, signal handling.
 
+When `{{TRANSPORT}}` is `streamable-http` or `both`, the bootstrap section must also address:
+session handling, SSE framing, CORS policy, and per-request auth.
+
 ## 5. Config
 
 Every env var.

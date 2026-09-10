@@ -37,6 +37,7 @@ Record the verify-gate result after each phase.
 - **No future-phase code.** Each phase must not implement anything from later phases.
 - **Conventions from 01-instructions.md §8** apply to every phase (error handling, logging, naming, testing style).
 - **stdio constraint.** On `{{TRANSPORT}}=stdio`, nothing may write to stdout except protocol frames. Verify this before finishing each phase.
+- **HTTP constraint.** On `{{TRANSPORT}}=streamable-http` or `both`, verify the server includes an HTTP-addressing scaffold: session handling, SSE framing, CORS policy, per-request auth. Verify this before finishing each phase.
 - **Confirmation gates.** Any tool marked "confirmation required" in `03-mcp-surface.md` must not execute its side effect without the confirmation flow the spec defines.
 
 ## Runner invocation
