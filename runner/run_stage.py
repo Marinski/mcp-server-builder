@@ -298,6 +298,42 @@ _CHILD_ENV_ALWAYS = ("PATH", "HOME", "LANG")
 _CHILD_ENV_WINDOWS = ("SYSTEMROOT", "TEMP", "USERPROFILE")
 
 
+# Explicit opt-in pass-through: a `pass_env` list on the provider (or, as a
+# broader opt-in, the runner) names ambient variables the stage's CLI needs and
+# the base allowlist does not cover — HTTPS_PROXY in a corporate network, say.
+# Names are validated against a known-safe pattern so a typo in models.yaml
+# cannot smuggle a shell metacharacter or a nonsense key into the child, and a
+# name absent from the parent is skipped silently: pass_env grants
+# pass-through, not invention.
+_PASS_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _pass_env_names(cfg: dict, provider: dict, runner: dict) -> list[str]:
+    """pass_env names declared on the provider, then on the runner (union)."""
+    names: list = []
+    for source in (runner.get("pass_env"), provider.get("pass_env")):
+        if not source:
+            continue
+        if not isinstance(source, list) or not all(
+                isinstance(n, str) and _PASS_ENV_NAME.match(n) for n in source):
+            sys.exit("pass_env must be a list of variable names matching "
+                     f"{_PASS_ENV_NAME.pattern} — got {source!r}")
+        names += [n for n in source if n not in names]
+    return names
+
+
+def _apply_pass_env(env: dict, cfg: dict, provider: dict, runner: dict,
+                    parent_env: dict) -> None:
+    """Copy pass_env names present in the parent into env.
+
+    Applied *before* the provider credential overlay so a pass_env entry can
+    never overwrite the resolved credential, whatever the name collision.
+    """
+    for name in _pass_env_names(cfg, provider, runner):
+        if name in parent_env:
+            env[name] = parent_env[name]
+
+
 def _base_child_env(parent_env: dict) -> dict:
     """The minimal environment a CLI needs to launch, before provider overlay."""
     names = list(_CHILD_ENV_ALWAYS)
@@ -318,14 +354,17 @@ def build_child_env(cfg: dict, attempt: dict, parent_env: dict,
 
     Starts from a small allowlist (``_base_child_env``) rather than
     ``os.environ.copy()`` so the child inherits only what it needs to launch,
-    then overlays the resolved provider's endpoint and credential. Nothing else
-    crosses the boundary: a variable the parent sets and this function does not
-    name is simply absent in the child.
+    then the provider's/runner's explicit ``pass_env`` names that the parent
+    actually sets, and finally overlays the resolved provider's endpoint and
+    credential — so a pass_env entry can never overwrite the credential.
+    Nothing else crosses the boundary: a variable the parent sets and this
+    function does not name is simply absent in the child.
     """
     provider_name = attempt["provider"]
     provider, runner = _resolve_provider_runner(cfg, attempt)
 
     env = _base_child_env(parent_env)
+    _apply_pass_env(env, cfg, provider, runner, parent_env)
 
     # Point the runner at this provider's endpoint. Values come from the
     # environment, never from the config file, so models.yaml stays committable.
