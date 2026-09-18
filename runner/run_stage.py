@@ -271,8 +271,8 @@ def resolve_chain(cfg: dict, stage: str) -> list[dict]:
     return deduped
 
 
-def build_command(cfg: dict, attempt: dict, prompt_file: Path,
-                  same_provider_fallbacks: list[str], strict: bool = True) -> tuple[list[str], dict]:
+def _resolve_provider_runner(cfg: dict, attempt: dict) -> tuple[dict, dict]:
+    """Resolve an attempt's provider and its runner from the config."""
     provider_name = attempt["provider"]
     provider = (cfg.get("providers") or {}).get(provider_name)
     if not provider:
@@ -282,6 +282,90 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
     runner = (cfg.get("runners") or {}).get(runner_name)
     if not runner:
         sys.exit(f"provider '{provider_name}' names unknown runner '{runner_name}'")
+
+    return provider, runner
+
+
+# Environment variables the child CLI needs in order to start at all. Anything
+# not named here is withheld: the stage agent has no business seeing the
+# invoking shell's full environment, and forwarding it hands unrelated
+# credentials (AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, ...) to a process we do not
+# control. Values are copied only when the parent actually sets them, so an
+# unset variable stays unset in the child.
+_CHILD_ENV_ALWAYS = ("PATH", "HOME", "LANG")
+# Windows CLIs resolve their runtime and temporary directories through these;
+# POSIX CLIs do not need them.
+_CHILD_ENV_WINDOWS = ("SYSTEMROOT", "TEMP", "USERPROFILE")
+
+
+def _base_child_env(parent_env: dict) -> dict:
+    """The minimal environment a CLI needs to launch, before provider overlay."""
+    names = list(_CHILD_ENV_ALWAYS)
+    if sys.platform == "win32":
+        names += _CHILD_ENV_WINDOWS
+    env: dict = {name: parent_env[name] for name in names if name in parent_env}
+    # Locale is set per-category (LC_ALL, LC_CTYPE, LC_TIME, ...); a CLI that
+    # renders text before the provider config is read needs all of them.
+    for name, value in parent_env.items():
+        if name.startswith("LC_"):
+            env[name] = value
+    return env
+
+
+def build_child_env(cfg: dict, attempt: dict, parent_env: dict,
+                    strict: bool = True) -> dict:
+    """Build the environment for a stage's CLI subprocess.
+
+    Starts from a small allowlist (``_base_child_env``) rather than
+    ``os.environ.copy()`` so the child inherits only what it needs to launch,
+    then overlays the resolved provider's endpoint and credential. Nothing else
+    crosses the boundary: a variable the parent sets and this function does not
+    name is simply absent in the child.
+    """
+    provider_name = attempt["provider"]
+    provider, runner = _resolve_provider_runner(cfg, attempt)
+
+    env = _base_child_env(parent_env)
+
+    # Point the runner at this provider's endpoint. Values come from the
+    # environment, never from the config file, so models.yaml stays committable.
+    base_url_env = provider.get("base_url_env")
+    if base_url_env:
+        value = parent_env.get(base_url_env)
+        if value:
+            env[runner.get("base_url_var", "OPENAI_BASE_URL")] = value
+        elif base_url_env != "ANTHROPIC_BASE_URL":
+            # An explicitly configured custom endpoint that is unset is a
+            # misconfiguration, not a silent fall-through to the vendor default.
+            msg = f"provider '{provider_name}': ${base_url_env} is not set"
+            if strict:
+                sys.exit(msg)
+            print(f"  warn: {msg}", file=sys.stderr)
+
+    key_env = provider.get("api_key_env")
+    if key_env:
+        value = parent_env.get(key_env)
+        if value:
+            env[runner.get("api_key_var", "OPENAI_API_KEY")] = value
+        else:
+            # Claude Code can be authenticated by OAuth, in which case no API key
+            # exists and demanding one would block a perfectly working setup. Every
+            # other runner talks to an endpoint that genuinely needs a credential.
+            msg = f"provider '{provider_name}': ${key_env} is not set"
+            if runner.get("auth_optional"):
+                print(f"  note: {msg}; relying on the CLI's own auth", file=sys.stderr)
+            elif strict:
+                sys.exit(msg)
+            else:
+                print(f"  warn: {msg}", file=sys.stderr)
+
+    return env
+
+
+def build_command(cfg: dict, attempt: dict, prompt_file: Path,
+                  same_provider_fallbacks: list[str], strict: bool = True) -> tuple[list[str], dict]:
+    provider_name = attempt["provider"]
+    provider, runner = _resolve_provider_runner(cfg, attempt)
 
     cmd_name = runner["cmd"]
     if not shutil.which(cmd_name):
@@ -305,39 +389,7 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
                .replace("{prompt_file}", str(prompt_file))
         )
 
-    env = os.environ.copy()
-    # Point the runner at this provider's endpoint. Values come from the
-    # environment, never from the config file, so models.yaml stays committable.
-    base_url_env = provider.get("base_url_env")
-    if base_url_env:
-        value = os.environ.get(base_url_env)
-        if value:
-            env[runner.get("base_url_var", "OPENAI_BASE_URL")] = value
-        elif base_url_env != "ANTHROPIC_BASE_URL":
-            # An explicitly configured custom endpoint that is unset is a
-            # misconfiguration, not a silent fall-through to the vendor default.
-            msg = f"provider '{provider_name}': ${base_url_env} is not set"
-            if strict:
-                sys.exit(msg)
-            print(f"  warn: {msg}", file=sys.stderr)
-
-    key_env = provider.get("api_key_env")
-    if key_env:
-        value = os.environ.get(key_env)
-        if value:
-            env[runner.get("api_key_var", "OPENAI_API_KEY")] = value
-        else:
-            # Claude Code can be authenticated by OAuth, in which case no API key
-            # exists and demanding one would block a perfectly working setup. Every
-            # other runner talks to an endpoint that genuinely needs a credential.
-            msg = f"provider '{provider_name}': ${key_env} is not set"
-            if runner.get("auth_optional"):
-                print(f"  note: {msg}; relying on the CLI's own auth", file=sys.stderr)
-            elif strict:
-                sys.exit(msg)
-            else:
-                print(f"  warn: {msg}", file=sys.stderr)
-
+    env = build_child_env(cfg, attempt, os.environ, strict=strict)
     return argv, env
 
 

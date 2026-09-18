@@ -117,6 +117,12 @@ review (their own supply-chain posture is worth matching), or when you want thei
 Endpoints and keys are read from **environment variables named in the config**, never
 stored in it, so `models.yaml` never contains a URL or secret.
 
+The stage CLI does not inherit the invoking shell's whole environment. The runner builds
+a minimal child environment — `PATH`, `HOME`, locale (`LANG`/`LC_*`), plus `SYSTEMROOT`,
+`TEMP` and `USERPROFILE` on Windows — and overlays only the resolved provider's key and
+base URL. An unrelated secret you happen to have exported (an `AWS_SECRET_ACCESS_KEY`,
+a `GITHUB_TOKEN`) is not handed to the stage agent.
+
 Inspect what a stage would run, without calling anything:
 
 ```bash
