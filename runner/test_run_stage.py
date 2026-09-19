@@ -8,6 +8,7 @@ endpoint the attempt actually resolved.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import stat
@@ -511,3 +512,187 @@ stages:
     assert "WebFetch(*)" in err_1a
     assert "--allowedTools" not in err_1a
     assert "--strict-mcp-config --mcp-config {}" in err_3
+
+
+# ── Symlink-safe artifact writes (finding 5405) ────────────────────────────
+
+
+def _record_args(docs: Path) -> argparse.Namespace:
+    """The minimal argparse namespace record_attempt needs."""
+    return argparse.Namespace(stage="1a", docs=docs, manifest=None)
+
+
+def test_log_capture_refuses_symlinked_logs_dir(tmp_path):
+    """A repo shipping docs/mcp/logs as a symlink must not turn the runner
+    into an arbitrary-file write: LogCapture refuses instead of writing
+    through the link (finding 5405)."""
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (docs / "logs").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError, match="symlink"):
+        with run_stage.LogCapture("1a", docs):
+            pass  # pragma: no cover — __enter__ raises first
+
+    assert list(outside.iterdir()) == []
+
+
+def test_record_attempt_refuses_symlinked_manifest(tmp_path):
+    """A repo shipping run-manifest.jsonl as a symlink must not turn the
+    runner into an arbitrary-file append primitive (finding 5405)."""
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (docs / "run-manifest.jsonl").symlink_to(
+        outside_dir / "manifest.jsonl")
+
+    attempt = {"provider": "stub", "model": "stub-model"}
+    with pytest.raises(OSError, match="symlink"):
+        run_stage.record_attempt(
+            _record_args(docs), attempt, 0, 1, 0,
+            duration_s=1.0, timed_out=False)
+
+    assert not (outside_dir / "manifest.jsonl").exists()
+
+
+def test_record_attempt_refuses_symlinked_manifest_parent(tmp_path):
+    """An ancestor of the manifest shipped as a symlink is refused too: the
+    check walks every component of the manifest path under --docs."""
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (docs / "logs").symlink_to(outside_dir, target_is_directory=True)
+
+    attempt = {"provider": "stub", "model": "stub-model"}
+    args = argparse.Namespace(
+        stage="1a", docs=docs, manifest=docs / "logs" / "run-manifest.jsonl")
+    with pytest.raises(OSError, match="symlink"):
+        run_stage.record_attempt(
+            args, attempt, 0, 1, 0, duration_s=1.0, timed_out=False)
+
+    assert list(outside_dir.iterdir()) == []
+
+
+def test_safe_open_refuses_symlink_target(tmp_path):
+    """safe_open refuses a final-component symlink even when no ancestor is
+    a link."""
+    outside = tmp_path / "evil.txt"
+    link = tmp_path / "victim"
+    link.symlink_to(outside)
+
+    with pytest.raises(OSError, match="symlink"):
+        run_stage.safe_open(link, "w", root=tmp_path, what="file")
+
+    assert not outside.exists()
+
+
+def test_safe_open_refuses_path_escaping_docs_root(tmp_path):
+    """safe_open refuses when the resolved real path escapes the docs root,
+    even with no symlink anywhere (e.g. a .. component)."""
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+    escape = docs / ".." / ".." / "escape.txt"
+
+    with pytest.raises(OSError, match="escapes"):
+        run_stage.safe_open(escape, "w", root=docs, what="file")
+
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_runner_artifacts_normal_run_unaffected(tmp_path):
+    """A normal (non-symlinked) run writes the tee'd log and appends the
+    manifest exactly as before."""
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+
+    with run_stage.LogCapture("1a", docs) as (log_path, lc):
+        lc.write("hello\n")
+        assert lc.tail() == "hello"
+
+    log = Path(log_path)
+    assert log.is_file()
+    assert not log.is_symlink()
+    assert log.read_text(encoding="utf-8") == "hello\n"
+
+    attempt = {"provider": "stub", "model": "stub-model"}
+    run_stage.record_attempt(
+        _record_args(docs), attempt, 0, 1, 0,
+        duration_s=1.0, timed_out=False,
+        log_path=str(log), output_tail="hello")
+
+    manifest = docs / "run-manifest.jsonl"
+    assert manifest.is_file()
+    assert not manifest.is_symlink()
+    records = [json.loads(line) for line in
+               manifest.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["stage"] == "1a"
+    assert records[0]["ok"] is True
+    assert records[0]["log_path"] == str(log)
+
+
+# ── new-project.sh symlink-safe writes (finding 5405) ─────────────────────
+
+
+def _run_new_project(repo: Path, *extra: str) -> subprocess.CompletedProcess:
+    script = Path(__file__).resolve().parent.parent / "new-project.sh"
+    return subprocess.run(
+        ["bash", str(script), "--repo", str(repo),
+         "--project", "Acme Server", "--server", "acme-server", *extra],
+        capture_output=True, text=True,
+    )
+
+
+def test_new_project_refuses_symlinked_run_config_env(tmp_path):
+    """run-config.env shipped as a symlink makes new-project.sh refuse
+    instead of writing through the link."""
+    repo = tmp_path / "repo"
+    (repo / "docs" / "mcp").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "docs" / "mcp" / "run-config.env").symlink_to(
+        outside, target_is_directory=True)
+
+    proc = _run_new_project(repo)
+
+    assert proc.returncode != 0
+    assert "symlink" in proc.stderr.lower()
+    assert list(outside.iterdir()) == []
+
+
+def test_new_project_refuses_symlinked_docs_dir(tmp_path):
+    """A repo shipping docs/mcp (the default DOCS dir) as a symlink is
+    refused too, before any write happens."""
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "docs" / "mcp").symlink_to(outside, target_is_directory=True)
+
+    proc = _run_new_project(repo)
+
+    assert proc.returncode != 0
+    assert "symlink" in proc.stderr.lower()
+    assert list(outside.iterdir()) == []
+
+
+def test_new_project_scaffolds_normally(tmp_path):
+    """A normal scaffold still writes run-config.env and 00-decisions.md."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    proc = _run_new_project(repo)
+
+    assert proc.returncode == 0, proc.stderr
+    env_file = repo / "docs" / "mcp" / "run-config.env"
+    assert env_file.is_file()
+    assert not env_file.is_symlink()
+    assert "SERVER=acme-server" in env_file.read_text()
+    decisions = repo / "docs" / "mcp" / "00-decisions.md"
+    assert decisions.is_file()
+    assert not decisions.is_symlink()
+    assert "# Decisions — Acme Server MCP server" in decisions.read_text()

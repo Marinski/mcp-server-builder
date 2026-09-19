@@ -160,6 +160,15 @@ prompt is **declined by default**. Three consequences, each found the hard way:
   contract (`runner/stage_contract.py`), and every stage resolves `acceptEdits`.
   Deliberately not `--dangerously-skip-permissions`, which would also unfence Bash (see
   Sandboxing below).
+- **Artifact writes never follow symlinks.** The runner's own writes — the tee'd log
+  under `docs/mcp/logs` and the `run-manifest.jsonl` append — go through `safe_open`
+  (`runner/run_stage.py`), which refuses a symlink target or a symlinked component under
+  `--docs`, refuses when the resolved path escapes the docs root, and opens with
+  `O_NOFOLLOW` where the OS supports it. Git stores symlinks as the link itself, so
+  without this a third-party clone shipping `docs/mcp/logs` (or `run-manifest.jsonl`) as
+  a symlink would turn the runner into an arbitrary-file write/append primitive; the
+  same containment is enforced by `new-project.sh` before it writes `run-config.env` /
+  `00-decisions.md`.
 - **Permissions are runner-owned, per stage.** `build_command` used to emit one identical
   argv for every stage and silently honor the target repo's own `.claude/settings.json` —
   so a third-party clone could widen the permission set. That is gone: every stage gets

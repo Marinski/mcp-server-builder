@@ -48,7 +48,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import IO, Iterable
 
 try:
     import yaml
@@ -177,6 +177,86 @@ def postflight_check(stage: str, docs: Path | None,
     return result
 
 
+def _ensure_regular_target(path: Path | str, *, root: Path | str | None = None,
+                           what: str = "file") -> None:
+    """Refuse (OSError) when *path* or any component under *root* is a symlink.
+
+    The runner's own artifact writes must never follow a symlink: git stores
+    symlinks as the link itself, so a target repo that ships e.g.
+    ``docs/mcp/logs`` or ``docs/mcp/run-manifest.jsonl`` as a symlink would
+    otherwise turn the runner into an arbitrary-file write/append primitive
+    (finding 5405). This check runs *before* mkdir() so a symlinked directory
+    cannot be silently reused either; the containment of the resolved real
+    path within *root* is enforced by :func:`safe_open`.
+
+    Only components at or below *root* are inspected: ancestors above the
+    artifact dir are the operator's own environment, not repo-shipped content.
+    """
+    path = Path(path)
+    # lstat the existing target and refuse on a symlink. os.path.islink does
+    # an lstat under the hood and is False for nonexistent paths.
+    if os.path.islink(path):
+        raise OSError(f"refusing to write {what} {path}: it is a symlink")
+
+    if root is not None:
+        root = Path(root)
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            # Not lexically under root (e.g. an explicit --manifest outside
+            # --docs); nothing below root to walk, containment is checked in
+            # safe_open().
+            rel = None
+        if rel is not None:
+            cur = root
+            for part in rel.parts:
+                cur = cur / part
+                if os.path.islink(cur):
+                    raise OSError(
+                        f"refusing to write {what} {path}: {cur} is a symlink")
+
+
+def safe_open(path: Path | str, mode: str, *, root: Path | str | None = None,
+              what: str = "file") -> IO[str]:
+    """Open *path* in *mode* without following symlinks.
+
+    Used for the runner's own artifact writes (the tee'd log under
+    ``<docs>/logs`` and the ``run-manifest.jsonl`` append). Refuses with
+    OSError when the target or any component under *root* is a symlink
+    (:func:`_ensure_regular_target`), when the resolved real path escapes
+    *root* (a repo-shipped ``docs/mcp/logs`` → /tmp link must not become an
+    arbitrary-file write), and opens with ``os.O_NOFOLLOW`` where the OS
+    supports it so the target cannot be swapped for a link between the check
+    and the open.
+    """
+    path = Path(path)
+    _ensure_regular_target(path, root=root, what=what)
+
+    if root is not None:
+        real_root = Path(os.path.realpath(root))
+        real = Path(os.path.realpath(path))
+        if not real.is_relative_to(real_root):
+            raise OSError(
+                f"refusing to write {what} {path}: resolved path "
+                f"{real} escapes {real_root}")
+
+    flags = {
+        "r": os.O_RDONLY,
+        "r+": os.O_RDWR,
+        "w": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        "w+": os.O_RDWR | os.O_CREAT | os.O_TRUNC,
+        "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        "a+": os.O_RDWR | os.O_CREAT | os.O_APPEND,
+    }.get(mode)
+    if flags is None:
+        raise ValueError(f"unsupported mode {mode!r} for {what} {path}")
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    if "b" in mode:
+        return os.fdopen(fd, mode)
+    return os.fdopen(fd, mode, encoding="utf-8")
+
+
 class LogCapture:
     """Tee stdout+stderr to a log file while streaming to console.
 
@@ -201,13 +281,20 @@ class LogCapture:
             return None, None
         ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         log_dir = self.docs / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
         name = f"{self.stage}"
         if self.phase:
             name += f"-phase{self.phase.split('/')[0]}"
         name += f"-{ts}.log"
         self._log_path = str(log_dir / name)
-        self._fh = open(self._log_path, "w", encoding="utf-8")
+        # The log lives under the artifact dir, which the target repo owns:
+        # refuse to follow a repo-shipped symlink (finding 5405) instead of
+        # turning the runner into an arbitrary-file write. Checked before
+        # mkdir so a symlinked docs/logs cannot be quietly reused, and again
+        # at open time with O_NOFOLLOW.
+        log_path = log_dir / name
+        _ensure_regular_target(log_path, root=self.docs, what="log file")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self._fh = safe_open(log_path, "w", root=self.docs, what="log file")
         return self._log_path, self
 
     def write(self, text: str) -> None:
@@ -578,6 +665,22 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
     path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
     if path is None:
         return
+    path = Path(path)
+    # The manifest records what actually ran. Append it without ever
+    # following a symlink: git stores symlinks, so a target repo could
+    # otherwise ship run-manifest.jsonl as a link that turns the runner
+    # into an arbitrary-file append primitive (finding 5405). Root
+    # containment applies when the manifest lives under --docs; an explicit
+    # --manifest elsewhere is the operator's own path, so only the
+    # final-component and O_NOFOLLOW guards apply there.
+    root = None
+    if args.docs is not None:
+        try:
+            path.relative_to(args.docs)
+            root = args.docs
+        except ValueError:
+            root = None
+    _ensure_regular_target(path, root=root, what="manifest")
     path.parent.mkdir(parents=True, exist_ok=True)
     record: dict = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -594,7 +697,7 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
         "log_path": log_path,
         "output_tail": output_tail,
     }
-    with path.open("a", encoding="utf-8") as fh:
+    with safe_open(path, "a", root=root, what="manifest") as fh:
         fh.write(json.dumps(record) + "\n")
 
 
