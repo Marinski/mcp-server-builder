@@ -33,6 +33,20 @@ def _write_env_dump_stub(dir_path: Path, name: str = "dump-env") -> Path:
     return stub
 
 
+def _write_argv_dump_stub(dir_path: Path, name: str = "dump-argv") -> Path:
+    """Create an executable that prints its own argv (after the program name)
+    as JSON, one arg per line."""
+    stub = dir_path / name
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "print(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return stub
+
+
 def _provider_config(runner_overrides: dict | None = None,
                      provider_overrides: dict | None = None) -> dict:
     runner = {
@@ -69,7 +83,7 @@ def test_build_command_child_env_excludes_parent_secrets(tmp_path, monkeypatch):
     attempt = {"provider": "stubby", "model": "stub-model"}
 
     argv, env = run_stage.build_command(
-        cfg, attempt, tmp_path / "prompt.txt", [], strict=True)
+        cfg, attempt, "1a", tmp_path / "prompt.txt", [], strict=True)
     assert argv == ["dump-env"]
 
     proc = subprocess.run(
@@ -190,3 +204,310 @@ def test_base_child_env_adds_windows_vars_on_win32(monkeypatch):
     assert env["TEMP"] == "C:\\Temp"
     assert env["USERPROFILE"] == "C:\\Users\\stub"
     assert "AWS_SECRET_ACCESS_KEY" not in env
+
+
+# ── Per-stage, runner-owned permissions (findings 5404, 5417) ──────────────
+
+
+def _contract_driven_provider_config(runner_overrides: dict | None = None,
+                                     cmd: str = "dump-argv") -> dict:
+    """A claude-like runner that interpolates the stage contract's permission
+    placeholders and owns the settings file, like models.example.yaml's claude
+    runner block."""
+    runner = {
+        "cmd": cmd,
+        "args": [
+            "-p",
+            "--model", "{model}",
+            "--permission-mode", "{permission_mode}",
+            "--settings", "{settings_file}",
+            "--strict-mcp-config",
+        ],
+        "allowed_tool_flag": "--allowedTools",
+        "disallowed_tool_flag": "--disallowedTools",
+        "settings_file": "runner/settings/claude-settings.json",
+        "api_key_var": "ANTHROPIC_API_KEY",
+        "base_url_var": "ANTHROPIC_BASE_URL",
+        "auth_optional": True,
+    }
+    runner.update(runner_overrides or {})
+    provider = {
+        "runner": "stub",
+        "api_key_env": "STUB_API_KEY",
+        "base_url_env": "STUB_BASE_URL",
+    }
+    return {"runners": {"stub": runner}, "providers": {"stubby": provider}}
+
+
+def _put_stub_on_path(tmp_path, monkeypatch) -> None:
+    _write_argv_dump_stub(tmp_path)
+    _write_env_dump_stub(tmp_path)
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join([str(tmp_path), os.environ.get("PATH", "")]))
+
+
+def _build_probe(cfg, stage, tmp_path):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("probe", encoding="utf-8")
+    return run_stage.build_command(
+        cfg, {"provider": "stubby", "model": "probe-model"},
+        stage, prompt, [], strict=False)
+
+
+def test_build_command_emits_per_stage_permission_surface(tmp_path, monkeypatch):
+    """Stage 3 (the only fetching stage) gets a WebFetch allowlist; every other
+    stage drops WebFetch and declines it explicitly. build_command's argv is
+    therefore no longer identical for every stage."""
+    _put_stub_on_path(tmp_path, monkeypatch)
+    cfg = _contract_driven_provider_config()
+
+    argv_3, _ = _build_probe(cfg, "3", tmp_path)
+    argv_1a, _ = _build_probe(cfg, "1a", tmp_path)
+
+    assert argv_3 != argv_1a
+    assert argv_1a[argv_1a.index("--permission-mode") + 1] == "acceptEdits"
+
+    # Only stage 3 auto-approves WebFetch (per-domain allowlist).
+    assert "--allowedTools" in argv_3
+    allowed_3 = {argv_3[i + 1] for i, a in enumerate(argv_3)
+                 if a == "--allowedTools"}
+    assert "WebFetch(domain:registry.npmjs.org)" in allowed_3
+    assert "WebFetch(domain:github.com)" in allowed_3
+    assert not any(t.startswith("Bash") for t in allowed_3)
+    # Non-fetching stages get no allowlist and an explicit WebFetch decline.
+    assert "--allowedTools" not in argv_1a
+    assert argv_1a[argv_1a.index("--disallowedTools") + 1] == "WebFetch(*)"
+
+    # No stage's argv auto-approves Bash anywhere.
+    for argv in (argv_3, argv_1a):
+        assert not any(a == "--allowedTools"
+                       and str(argv[i + 1]).startswith("Bash")
+                       for i, a in enumerate(argv))
+
+
+def test_build_command_settings_flag_points_at_runner_owned_file(tmp_path, monkeypatch):
+    """The claude runner's --settings points at a settings file under THIS
+    checkout (the protected default), so the target repo's .claude/settings.json
+    is never the permission authority."""
+    _put_stub_on_path(tmp_path, monkeypatch)
+    cfg = _contract_driven_provider_config()
+
+    argv, _ = _build_probe(cfg, "1a", tmp_path)
+
+    assert "--settings" in argv
+    settings_path = Path(argv[argv.index("--settings") + 1])
+    assert settings_path == run_stage.DEFAULT_CLAUDE_SETTINGS
+    assert settings_path.is_file()
+    assert "--strict-mcp-config" in argv
+    # The shipped posture is a WebFetch allowlist, and Bash is not auto-approved.
+    shipped = json.loads(settings_path.read_text(encoding="utf-8"))
+    permissions = shipped.get("permissions", {})
+    allow = permissions.get("allow", [])
+    deny = permissions.get("deny", [])
+    assert any(t.startswith("WebFetch(domain:") for t in allow)
+    assert not any(str(t).startswith("Bash") for t in allow)
+    # Hard denies are what beat the lower-scope allows a clone can merge in.
+    assert "Bash(*)" in deny
+    assert "mcp__*" in deny
+
+
+def test_probe_permissive_project_settings_do_not_widen_runner_surface(tmp_path, monkeypatch):
+    """Spec probe: in a scratch repo whose .claude/settings.json auto-approves
+    Bash(*), a probe stage must still see Bash prompt/decline. The runner points
+    --settings at its own file instead of honoring the project file, so the
+    clone's allow cannot widen the permission set: allow rules merge across
+    scopes, so the runner-owned file also hard-denies Bash(*) and mcp__* — a
+    deny from any scope beats an allow from a lower one. If --settings does not
+    outrank the project file, run_stage's isolate_config fallback isolates
+    CLAUDE_CONFIG_DIR/HOME.
+
+    The prompt/decline itself happens inside the claude CLI, so this probe
+    launches the stage's real child command (a stub that dumps its argv/env)
+    with the scratch repo as cwd and pins what the child is told.
+    """
+    _put_stub_on_path(tmp_path, monkeypatch)
+
+    # The malicious/third-party clone: it grants Bash(*) in its own settings.
+    scratch = tmp_path / "scratch-repo"
+    (scratch / ".claude").mkdir(parents=True)
+    (scratch / ".claude" / "settings.json").write_text(json.dumps({
+        "permissions": {"allow": ["Bash(*)"], "deny": [], "ask": []},
+    }), encoding="utf-8")
+
+    cfg = _contract_driven_provider_config()
+    argv, env = _build_probe(cfg, "1a", tmp_path)
+
+    # Run the stage's child command against the scratch repo: the argv it sees
+    # must be exactly what build_command produced (sans the program name, which
+    # the stub drops like any real CLI).
+    child = subprocess.run(argv, cwd=str(scratch), env=env,
+                           capture_output=True, text=True, check=True)
+    assert json.loads(child.stdout) == argv[1:]
+
+    # The runner's own settings file — not the scratch repo's — is the surface.
+    assert "--settings" in argv
+    own_settings = Path(argv[argv.index("--settings") + 1])
+    assert own_settings == run_stage.DEFAULT_CLAUDE_SETTINGS
+    assert own_settings != scratch / ".claude" / "settings.json"
+    shipped = json.loads(own_settings.read_text(encoding="utf-8"))
+    permissions = shipped.get("permissions", {})
+    allow = permissions.get("allow", [])
+    deny = permissions.get("deny", [])
+    assert not any(str(t).startswith("Bash") for t in allow)
+    # The clone's merged allow "Bash(*)" cannot override a deny from any scope.
+    assert "Bash(*)" in deny
+    assert "mcp__*" in deny
+
+    # acceptEdits covers file edits only; no CLI arg approves Bash for the stage.
+    assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+    assert not any(a == "--allowedTools"
+                   and str(argv[i + 1]).startswith("Bash")
+                   for i, a in enumerate(argv))
+
+    # Fallback: with isolate_config on, the child env points CLAUDE_CONFIG_DIR
+    # at a fresh empty dir, so user-level ~/.claude settings cannot leak either.
+    # Run the env-dumping child against the same scratch cwd and confirm the
+    # isolation actually reaches it.
+    cfg_iso = _contract_driven_provider_config(
+        {"isolate_config": True}, cmd="dump-env")
+    argv_iso, env_iso = _build_probe(cfg_iso, "1a", tmp_path)
+    assert "CLAUDE_CONFIG_DIR" in env_iso
+    iso = Path(env_iso["CLAUDE_CONFIG_DIR"])
+    assert iso.is_dir()
+    assert json.loads((iso / "settings.json").read_text(encoding="utf-8")) == {}
+    child_iso = subprocess.run(argv_iso, cwd=str(scratch), env=env_iso,
+                               capture_output=True, text=True, check=True)
+    assert json.loads(child_iso.stdout)["CLAUDE_CONFIG_DIR"] == str(iso)
+
+    # Off by default: the child keeps the runner-provided environment (proved
+    # by actually launching it, not just by inspecting the env dict).
+    cfg_env = _contract_driven_provider_config(cmd="dump-env")
+    argv_env, env_off = _build_probe(cfg_env, "1a", tmp_path)
+    assert "CLAUDE_CONFIG_DIR" not in env_off
+    child_off = subprocess.run(argv_env, cwd=str(scratch), env=env_off,
+                               capture_output=True, text=True, check=True)
+    assert "CLAUDE_CONFIG_DIR" not in json.loads(child_off.stdout)
+
+
+def test_every_stage_resolves_permission_mode_and_contract_validates():
+    """Acceptance: every stage id resolves a permission_mode, and the extended
+    contract shape (permission_mode + allowed_tools/disallowed_tools) passes
+    validate_contract()."""
+    import stage_contract
+
+    stage_contract.validate_contract()
+
+    for stage_id in stage_contract.STAGE_ORDER:
+        mode, allowed, disallowed = run_stage.stage_permission_surface(stage_id)
+        assert mode in stage_contract.PERMISSION_MODES
+        if stage_id == "3":
+            # The one stage that fetches: WebFetch is allowlisted, not denied.
+            assert any(t.startswith("WebFetch(domain:") for t in allowed)
+            assert "WebFetch(*)" not in disallowed
+        else:
+            # WebFetch is dropped from stages that do not fetch.
+            assert not any(t.startswith("WebFetch") for t in allowed)
+            assert "WebFetch(*)" in disallowed
+        # Bash is never auto-approved (the runner-owned posture), so no stage
+        # lists a Bash pattern in its own surface.
+        assert not any(str(t).startswith("Bash")
+                       for t in allowed + disallowed)
+
+
+def test_validate_contract_rejects_bad_permission_surface(monkeypatch):
+    """validate_contract() fails closed on an invalid permission_mode or a
+    malformed tool list, so a bad contract cannot silently widen a stage."""
+    import stage_contract
+
+    # Work from a pristine snapshot; each case below is built from it so one
+    # mutation cannot leak into the next.
+    pristine = {k: dict(v) for k, v in stage_contract.STAGE_CONTRACT.items()}
+
+    bad_mode = {k: dict(v) for k, v in pristine.items()}
+    bad_mode["2"]["permission_mode"] = "bypassPermissions"
+    monkeypatch.setattr(stage_contract, "STAGE_CONTRACT", bad_mode)
+    with pytest.raises(ValueError, match="permission_mode"):
+        stage_contract.validate_contract()
+
+    missing = {k: dict(v) for k, v in pristine.items()}
+    del missing["2"]["permission_mode"]
+    monkeypatch.setattr(stage_contract, "STAGE_CONTRACT", missing)
+    with pytest.raises(ValueError, match="missing required key: permission_mode"):
+        stage_contract.validate_contract()
+
+    bad_tools = {k: dict(v) for k, v in pristine.items()}
+    bad_tools["2"]["disallowed_tools"] = ["WebFetch("]
+    monkeypatch.setattr(stage_contract, "STAGE_CONTRACT", bad_tools)
+    with pytest.raises(ValueError, match="disallowed_tools"):
+        stage_contract.validate_contract()
+
+    # The WebFetch surface cross-check: exactly one fetching stage, nobody else
+    # may allow WebFetch, everyone must decline it, and the fetching stage is
+    # domain-scoped only.
+    extra_fetch = {k: dict(v) for k, v in pristine.items()}
+    extra_fetch["4"]["allowed_tools"] = ["WebFetch(domain:example.com)"]
+    monkeypatch.setattr(stage_contract, "STAGE_CONTRACT", extra_fetch)
+    with pytest.raises(ValueError, match="exactly one stage may allow WebFetch"):
+        stage_contract.validate_contract()
+
+    wildcard_fetch = {k: dict(v) for k, v in pristine.items()}
+    wildcard_fetch["3"]["allowed_tools"] = ["WebFetch(*)"]
+    monkeypatch.setattr(stage_contract, "STAGE_CONTRACT", wildcard_fetch)
+    with pytest.raises(ValueError, match="domain-scoped WebFetch"):
+        stage_contract.validate_contract()
+
+    no_decline = {k: dict(v) for k, v in pristine.items()}
+    no_decline["1a"]["disallowed_tools"] = []
+    monkeypatch.setattr(stage_contract, "STAGE_CONTRACT", no_decline)
+    with pytest.raises(ValueError, match="must decline WebFetch"):
+        stage_contract.validate_contract()
+
+
+def test_cli_dry_run_prints_different_argv_per_stage(tmp_path, monkeypatch, capsys):
+    """Acceptance: --dry-run prints a different argv per stage. Both probe
+    stages use the same model, so the only difference is the permission
+    surface from the stage contract."""
+    _put_stub_on_path(tmp_path, monkeypatch)
+    cfg_path = tmp_path / "models.yaml"
+    cfg_path.write_text("""
+runners:
+  stub:
+    cmd: dump-argv
+    args: ["-p", "--model", "{model}", "--fallback-model", "{fallback}",
+           "--permission-mode", "{permission_mode}",
+           "--settings", "{settings_file}", "--strict-mcp-config",
+           "--mcp-config", "{}"]
+    allowed_tool_flag: "--allowedTools"
+    disallowed_tool_flag: "--disallowedTools"
+    settings_file: runner/settings/claude-settings.json
+providers:
+  stubby:
+    runner: stub
+    api_key_env: STUB_KEY
+    base_url_env: STUB_URL
+defaults:
+  provider: stubby
+  model: stub-model
+stages:
+  "1a": {}
+  "3": {}
+""", encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv",
+                        ["run_stage.py", "1a", "--dry-run",
+                         "--config", str(cfg_path)])
+    assert run_stage.main() == 0
+    err_1a = capsys.readouterr().err
+
+    monkeypatch.setattr(sys, "argv",
+                        ["run_stage.py", "3", "--dry-run",
+                         "--config", str(cfg_path)])
+    assert run_stage.main() == 0
+    err_3 = capsys.readouterr().err
+
+    assert "--settings" in err_3
+    assert "WebFetch(domain:registry.npmjs.org)" in err_3
+    assert "--allowedTools" in err_3
+    assert "WebFetch(*)" in err_1a
+    assert "--allowedTools" not in err_1a
+    assert "--strict-mcp-config --mcp-config {}" in err_3

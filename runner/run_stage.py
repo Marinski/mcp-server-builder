@@ -17,6 +17,16 @@ supposed to read and write.
 
   ./runner/run_stage.py 2 --docs /path/to/repo/docs/mcp --dry-run
 
+The argv a stage runs is per-stage: permission_mode and the allowed/
+disallowed tool lists come from runner/stage_contract.py, and the claude
+runner points --settings at a settings file shipped under this checkout
+(runner/settings/claude-settings.json). Claude Code merges permission rules
+across settings scopes, so the shipped file pairs its WebFetch allowlist
+with hard deny rules (Bash(*) and mcp__*); a deny from any scope beats an
+allow from a lower scope, which is what keeps a third-party clone's
+.claude/settings.json from widening the permission set. See README
+"Non-interactive sessions and permissions".
+
 Per-stage state is computed in memory from the manifest and the artifacts on
 disk, and is never persisted to a file:
 
@@ -35,6 +45,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Iterable
@@ -349,6 +360,55 @@ def _base_child_env(parent_env: dict) -> dict:
     return env
 
 
+# The runner-owned settings file for the claude runner. Permissions for a
+# stage come from THIS file (under the pipeline checkout), never from the
+# target repo's .claude/settings.json — a third-party clone must not be able
+# to widen the permission set (findings 5404, 5417). models.yaml's claude
+# runner references it via --settings {settings_file}; `settings_file` on a
+# runner overrides the path.
+DEFAULT_CLAUDE_SETTINGS = ROOT / "runner" / "settings" / "claude-settings.json"
+
+
+def resolve_settings_file(runner: dict) -> str:
+    """Absolute path to a runner's settings file.
+
+    Defaults to the file shipped under this checkout (DEFAULT_CLAUDE_SETTINGS);
+    models.yaml can override with `settings_file` on the runner. Relative
+    paths resolve against the checkout root so the value stays committable
+    and portable.
+    """
+    value = runner.get("settings_file")
+    if not value:
+        return str(DEFAULT_CLAUDE_SETTINGS)
+    p = Path(value)
+    return str(p if p.is_absolute() else ROOT / p)
+
+
+def _isolated_config_dir() -> str:
+    """A fresh, empty config dir for a stage's CLI process.
+
+    This is the opt-in fallback for claude versions whose --settings flag
+    does not outrank the target repo's .claude/settings.json (see the probe
+    in test_run_stage.py): pointing CLAUDE_CONFIG_DIR at this scratch dir
+    removes the invoking user's ~/.claude settings, skills and OAuth
+    credentials from the session, and gives the stage a deterministic empty
+    settings file.
+
+    Enable per runner with `isolate_config: true`. With the shipped default
+    this isolation is NOT applied: the invoking user's ~/.claude settings
+    (whose allow rules merge with the runner-owned file), skills and OAuth
+    credentials are part of every session — treat the invocation user as
+    trusted, and prefer running stages in a container (see README
+    "Sandboxing"). Isolating CLAUDE_CONFIG_DIR also hides any OAuth login
+    stored in ~/.claude, so a stage then needs a key via the provider's
+    api_key_env. The scratch dir is left in place so the child can keep
+    reading it for the lifetime of the session.
+    """
+    d = Path(tempfile.mkdtemp(prefix="mcp-builder-claude-config-"))
+    (d / "settings.json").write_text("{}", encoding="utf-8")
+    return str(d)
+
+
 def build_child_env(cfg: dict, attempt: dict, parent_env: dict,
                     strict: bool = True) -> dict:
     """Build the environment for a stage's CLI subprocess.
@@ -366,6 +426,15 @@ def build_child_env(cfg: dict, attempt: dict, parent_env: dict,
 
     env = _base_child_env(parent_env)
     _apply_pass_env(env, cfg, provider, runner, parent_env)
+
+    # Fallback isolation: point the CLI's config dir at a fresh scratch dir so
+    # the invoking user's ~/.claude (settings that could widen permissions,
+    # skills, OAuth credentials) never leaks into the session. Off by default
+    # because claude's own --settings flag already replaces the target repo's
+    # project settings, and because isolating the config dir hides OAuth
+    # logins. Enable per runner with `isolate_config: true`.
+    if runner.get("isolate_config"):
+        env["CLAUDE_CONFIG_DIR"] = _isolated_config_dir()
 
     # Point the runner at this provider's endpoint. Values come from the
     # environment, never from the config file, so models.yaml stays committable.
@@ -402,8 +471,39 @@ def build_child_env(cfg: dict, attempt: dict, parent_env: dict,
     return env
 
 
-def build_command(cfg: dict, attempt: dict, prompt_file: Path,
+def stage_permission_surface(stage: str) -> tuple[str, list[str], list[str]]:
+    """The stage contract's permission surface: (permission_mode, allowed_tools,
+    disallowed_tools).
+
+    Unknown stages fall back to the least permissive mode ("default") so a
+    typo in a routing config can never silently widen a stage's surface.
+    """
+    from stage_contract import STAGE_CONTRACT  # type: ignore[import]
+
+    entry = STAGE_CONTRACT.get(stage) or {}
+    return (
+        entry.get("permission_mode", "default"),
+        list(entry.get("allowed_tools", [])),
+        list(entry.get("disallowed_tools", [])),
+    )
+
+
+def build_command(cfg: dict, attempt: dict, stage: str, prompt_file: Path,
                   same_provider_fallbacks: list[str], strict: bool = True) -> tuple[list[str], dict]:
+    """Build the argv/env for one stage attempt.
+
+    The emitted argv is per-stage: the ``{permission_mode}``, ``{settings_file}``
+    and ``{stage}`` placeholders and the per-stage allowed/disallowed tool
+    lists come from runner/stage_contract.py, so every stage gets its own
+    permission surface instead of one identical surface for all (finding 5404).
+    The ``--settings`` flag points at a settings file shipped under THIS
+    checkout (runner/settings/claude-settings.json by default), never at the
+    target repo's .claude/settings.json. Claude Code merges permission rules
+    across scopes, so the file also hard-denies Bash(*) and mcp__*: a deny
+    rule from any scope beats an allow from a lower scope, which is what
+    stops a third-party clone from widening the permission set (finding 5417 —
+    a clone can at most add allow rules, and those cannot override the deny).
+    """
     provider_name = attempt["provider"]
     provider, runner = _resolve_provider_runner(cfg, attempt)
 
@@ -420,6 +520,13 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
     # config key, which is what runners expecting "provider/model" need.
     provider_arg = provider.get("remote", provider_name)
 
+    # The per-stage permission surface. Every stage resolves a permission_mode;
+    # allowed/disallowed tools are the stage contract's per-stage lists.
+    permission_mode, allowed_tools, disallowed_tools = stage_permission_surface(stage)
+
+    # Resolve once per stage attempt, not once per arg token below.
+    settings_file = resolve_settings_file(runner)
+
     argv = [cmd_name]
     for raw in runner.get("args", []):
         argv.append(
@@ -427,7 +534,20 @@ def build_command(cfg: dict, attempt: dict, prompt_file: Path,
                .replace("{provider}", provider_arg)
                .replace("{fallback}", fallback_arg)
                .replace("{prompt_file}", str(prompt_file))
+               .replace("{stage}", stage)
+               .replace("{permission_mode}", permission_mode)
+               .replace("{settings_file}", settings_file)
         )
+
+    # Per-stage tool allow/deny, emitted as repeated flag/value pairs (claude
+    # accumulates repeated --allowedTools/--disallowedTools). Only runners that
+    # name a *_tool_flag get them; opencode/pi have no such CLI surface.
+    for tool in allowed_tools:
+        if runner.get("allowed_tool_flag"):
+            argv += [runner["allowed_tool_flag"], tool]
+    for tool in disallowed_tools:
+        if runner.get("disallowed_tool_flag"):
+            argv += [runner["disallowed_tool_flag"], tool]
 
     env = build_child_env(cfg, attempt, os.environ, strict=strict)
     return argv, env
@@ -572,8 +692,8 @@ def run_stage_once(stage: str, cfg: dict, args: argparse.Namespace,
         same_provider = [c["model"] for c in chain[i + 1:]
                          if c["provider"] == attempt["provider"]]
         try:
-            argv, env = build_command(cfg, attempt, prompt_file, same_provider,
-                                      strict=True)
+            argv, env = build_command(cfg, attempt, stage, prompt_file,
+                                      same_provider, strict=True)
         except FileNotFoundError as exc:
             print(f"  skip {attempt['provider']}/{attempt['model']}: "
                   f"'{exc}' not on PATH", file=sys.stderr)
@@ -988,8 +1108,8 @@ def main() -> int:
         # claude's own --fallback-model, saving a process restart.
         same_provider = [c["model"] for c in chain[i + 1:] if c["provider"] == attempt["provider"]]
         try:
-            argv, env = build_command(cfg, attempt, prompt_file, same_provider,
-                                      strict=not args.dry_run)
+            argv, env = build_command(cfg, attempt, args.stage, prompt_file,
+                                      same_provider, strict=not args.dry_run)
         except FileNotFoundError as exc:
             print(f"  skip {attempt['provider']}/{attempt['model']}: '{exc}' not on PATH",
                   file=sys.stderr)
