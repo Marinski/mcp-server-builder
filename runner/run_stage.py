@@ -132,12 +132,21 @@ def preflight_check(stage: str, docs: Path | None,
                             f"with prior stage-5 manifest entry M={prev_m}")
 
 
+def _has_markdown_header(line: str) -> bool:
+    """Return True if a line looks like a markdown header (starts with one or more '#')."""
+    return line.startswith("#")
+
+
 def postflight_check(stage: str, docs: Path | None,
                      outputs: list[dict]) -> list[dict]:
     """After a successful run, record exists/size/mtime for tracked output paths.
 
     Stage 5: skip existence check (completion = ok attempt for phase N/M).
     Stage 9: skip entirely (returns empty).
+
+    For all other stages, validate that stage outputs match structural requirements:
+      - Non-empty content (not just whitespace).
+      - For single-file artifacts: presence of markdown-style headers.
     """
     if stage == "9" or docs is None:
         return outputs
@@ -155,14 +164,31 @@ def postflight_check(stage: str, docs: Path | None,
     for filename in contract.get("postflight_outputs", []):
         fpath = docs / filename
         exists = fpath.is_file()
+        
+        # Content validation: ensure the file has meaningful content beyond whitespace.
+        if exists and fpath.stat().st_size > 0:
+            lines = fpath.read_text().splitlines()
+            content_valid = any(line.strip() for line in lines)
+        else:
+            content_valid = False
+        
+        # Check for specific headers if SHAPE_SINGLE_FILE is used.
+        # A markdown header is a line beginning with one or more '#' characters.
+        header_valid = True
+        if contract.get("artifact_shape") == "single-file" and exists:
+            header_valid = any(_has_markdown_header(line) for line in fpath.read_text().splitlines())
+
         result.append({
             "path": str(fpath),
             "shape": contract["artifact_shape"],
             "exists": exists,
+            "content_valid": content_valid,
+            "header_valid": header_valid,
             "size": fpath.stat().st_size if exists else 0,
             "mtime": fpath.stat().st_mtime if exists else 0.0,
         })
     return result
+
 
 
 class LogCapture:
