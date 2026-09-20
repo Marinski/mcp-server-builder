@@ -29,6 +29,19 @@ Permission surface per stage:
                        auto-approved anywhere (see the runner-owned settings
                        file referenced from models.yaml); these lists are the
                        per-stage hard constraints on top of that.
+#
+# Read-only stages ("1a", "1b" — the playbook runs Stage 1 in "fresh session,
+# repo mounted, read-only") resolve a NON-editing permission mode ("default"):
+# a non-interactive -p session has no TTY to approve a Write/Edit, so the
+# attempt is declined — a read-only stage cannot create a file outside
+# docs/mcp (runner/probe_read_only.py pins this against the scratch repo).
+# Path-scoped edit rules (Edit(docs/mcp/**), the spec's Open Question 2) are
+# not relied on: no deployed claude build could be probed in the offline
+# checkout to positively confirm the syntax, so the spec's prescribed fallback
+# ships instead. The artifact-write exception is therefore APPROXIMATED:
+# postflight_outputs still name the stage's artifact, but the read-only stage
+# cannot auto-accept it on disk — capture it from the stage's output (final
+# message / tee'd log) to materialize it.
 """
 
 from __future__ import annotations
@@ -43,6 +56,12 @@ STAGE_ORDER: list[str] = ["1a", "1b", "2", "3", "4", "5", "6", "7", "8", "9"]
 # runner-owned posture is that Bash is never auto-approved, and bypassing
 # permissions would silently undo exactly that.
 PERMISSION_MODES: tuple[str, ...] = ("default", "acceptEdits", "plan")
+
+# Stages the playbook documents read-only ("fresh session, repo mounted,
+# read-only"). These must never resolve an editing mode: see the module
+# docstring — the probe in runner/probe_read_only.py pins the read-only
+# surface, and validate_contract() refuses acceptEdits for them.
+READ_ONLY_STAGES: tuple[str, ...] = ("1a", "1b")
 
 # A tool pattern is a tool name optionally followed by a parenthesized
 # selector, e.g. "WebFetch(domain:github.com)" or "Bash(*)".
@@ -94,7 +113,14 @@ STAGE_CONTRACT: dict[str, dict] = {
         "preflight_inputs": [],
         "postflight_outputs": ["01-instructions.md"],
         "human_gated": False,
-        "permission_mode": "acceptEdits",
+        # Read-only stage (playbook §Stage 1). Probe-pinned surface
+        # (runner/probe_read_only.py): a NON-editing mode — a -p session
+        # declines Write/Edit without a TTY, so the stage cannot create a file
+        # outside docs/mcp. Path-scoped edit rules (Edit(docs/mcp/**), spec
+        # Open Question 2) are not relied on; the artifact-write exception is
+        # APPROXIMATED — the stage's artifact is captured from its output
+        # rather than auto-accepted on disk.
+        "permission_mode": "default",
         "disallowed_tools": ["WebFetch(*)"],
     },
     "1b": {
@@ -102,7 +128,9 @@ STAGE_CONTRACT: dict[str, dict] = {
         "preflight_inputs": [],
         "postflight_outputs": ["01-signatures.md"],
         "human_gated": False,
-        "permission_mode": "acceptEdits",
+        # Read-only stage (playbook §Stage 1). Same approximate artifact-write
+        # exception as 1a: non-editing mode, artifact captured from output.
+        "permission_mode": "default",
         "disallowed_tools": ["WebFetch(*)"],
     },
     "2": {
@@ -229,6 +257,16 @@ def validate_contract() -> None:
                 f"not in {PERMISSION_MODES}; bypassPermissions is never valid "
                 "here — the runner-owned posture is that Bash is never "
                 "auto-approved")
+
+        # Read-only stages must stay read-only: the probe-pinned surface is a
+        # non-editing mode, so an edit that could touch target source can never
+        # be auto-accepted for them. Their artifact-write exception is
+        # approximated instead (see the module docstring).
+        if stage_id in READ_ONLY_STAGES and entry["permission_mode"] == "acceptEdits":
+            raise ValueError(
+                f"stage {stage_id} is read-only ({READ_ONLY_STAGES}) and must "
+                "not resolve acceptEdits — use a non-editing mode (default); "
+                "the artifact-write exception is approximated")
 
         # allowed_tools / disallowed_tools are optional lists of tool patterns.
         for key in ("allowed_tools", "disallowed_tools"):

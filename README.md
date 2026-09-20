@@ -155,11 +155,17 @@ prompt is **declined by default**. Three consequences, each found the hard way:
   directory (derived from `--docs`, or set explicitly with `--cwd`) — otherwise a stage
   invoked from this repo is silently sandboxed out of the repo it is meant to read and write.
 - **File writes.** Every stage writes its own artifact; without `--permission-mode
-  acceptEdits` the declined Write leaves the stage exiting 0 with no file on disk and the
-  document unrecoverable. The runner passes `--permission-mode` per stage from the stage
-  contract (`runner/stage_contract.py`), and every stage resolves `acceptEdits`.
-  Deliberately not `--dangerously-skip-permissions`, which would also unfence Bash (see
-  Sandboxing below).
+  acceptEdits` the declined Write leaves the stage exiting 0 with no file on disk and
+  the document unrecoverable. The runner passes `--permission-mode` per stage from the stage
+  contract (`runner/stage_contract.py`): stages that write project artifacts (2-9) resolve
+  `acceptEdits`, while the onboarding stages 1a/1b are pinned **read-only** and resolve the
+  non-editing mode `default` (see `mcp-server-creation-workflow.md` §Stage 1). The read-only
+  enforcement is probed by `runner/probe_read_only.py`, whose transcript is committed under
+  `scratch-repo/probe-read-only-transcript.md`: the read-only stage cannot create a file
+  outside `docs/mcp`, the write stages can. Because a read-only stage cannot auto-accept even
+  its own artifact write, that write-exception is approximated — `01-instructions.md` /
+  `01-signatures.md` are captured from the stage's output. Deliberately not
+  `--dangerously-skip-permissions`, which would also unfence Bash (see Sandboxing below).
 - **Artifact writes never follow symlinks.** The runner's own writes — the tee'd log
   under `docs/mcp/logs` and the `run-manifest.jsonl` append — go through `safe_open`
   (`runner/run_stage.py`), which refuses a symlink target or a symlinked component under

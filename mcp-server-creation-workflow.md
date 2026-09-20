@@ -77,6 +77,14 @@ Every stage writes exactly these files. Later stages read them instead of re-cra
 **Agent:** `agency-engineering:Codebase Onboarding Engineer` (`agents/engineering-codebase-onboarding-engineer.md`)
 **Skills:** `code:instruction-generation`, then `code:signatures`.
 
+> **Read-only is enforced.** Stage 1's permission mode pins to the non-editing
+> `default` in `runner/stage_contract.py` (along with `1b`); the write stages 2-9
+> resolve `acceptEdits`. The enforcement is probed by `runner/probe_read_only.py`,
+> whose transcript is committed at `scratch-repo/probe-read-only-transcript.md`.
+> The artifact-write exception is approximated: as the note below describes, the
+> skill's file outputs are captured from the stage's output rather than written
+> into the repo by its session.
+
 > **Skills that write into the target repo.** `code:instruction-generation` emits several
 > intermediate artifacts and targets `.github/copilot-instructions.md`. That collides with
 > this stage being read-only, with the artifact contract, and — if the project already has

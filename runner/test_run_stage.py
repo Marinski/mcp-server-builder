@@ -257,16 +257,22 @@ def _build_probe(cfg, stage, tmp_path):
 
 def test_build_command_emits_per_stage_permission_surface(tmp_path, monkeypatch):
     """Stage 3 (the only fetching stage) gets a WebFetch allowlist; every other
-    stage drops WebFetch and declines it explicitly. build_command's argv is
-    therefore no longer identical for every stage."""
+    stage drops WebFetch and declines it explicitly. Read-only stages (1a, 1b)
+    resolve the non-editing 'default' mode; artifact-writing stages keep
+    acceptEdits. build_command's argv is therefore no longer identical for
+    every stage."""
     _put_stub_on_path(tmp_path, monkeypatch)
     cfg = _contract_driven_provider_config()
 
     argv_3, _ = _build_probe(cfg, "3", tmp_path)
     argv_1a, _ = _build_probe(cfg, "1a", tmp_path)
+    argv_5, _ = _build_probe(cfg, "5", tmp_path)
 
     assert argv_3 != argv_1a
-    assert argv_1a[argv_1a.index("--permission-mode") + 1] == "acceptEdits"
+    # Read-only stage 1 runs a non-editing mode; the write stage keeps
+    # acceptEdits so its artifact (and the project it modifies) can land.
+    assert argv_1a[argv_1a.index("--permission-mode") + 1] == "default"
+    assert argv_5[argv_5.index("--permission-mode") + 1] == "acceptEdits"
 
     # Only stage 3 auto-approves WebFetch (per-domain allowlist).
     assert "--allowedTools" in argv_3
@@ -336,7 +342,9 @@ def test_probe_permissive_project_settings_do_not_widen_runner_surface(tmp_path,
     }), encoding="utf-8")
 
     cfg = _contract_driven_provider_config()
-    argv, env = _build_probe(cfg, "1a", tmp_path)
+    # Probe a write stage (5): the run that "legitimately modifies the
+    # project" is the one whose widen attempt would matter.
+    argv, env = _build_probe(cfg, "5", tmp_path)
 
     # Run the stage's child command against the scratch repo: the argv it sees
     # must be exactly what build_command produced (sans the program name, which
@@ -371,7 +379,7 @@ def test_probe_permissive_project_settings_do_not_widen_runner_surface(tmp_path,
     # isolation actually reaches it.
     cfg_iso = _contract_driven_provider_config(
         {"isolate_config": True}, cmd="dump-env")
-    argv_iso, env_iso = _build_probe(cfg_iso, "1a", tmp_path)
+    argv_iso, env_iso = _build_probe(cfg_iso, "5", tmp_path)
     assert "CLAUDE_CONFIG_DIR" in env_iso
     iso = Path(env_iso["CLAUDE_CONFIG_DIR"])
     assert iso.is_dir()
@@ -383,7 +391,7 @@ def test_probe_permissive_project_settings_do_not_widen_runner_surface(tmp_path,
     # Off by default: the child keeps the runner-provided environment (proved
     # by actually launching it, not just by inspecting the env dict).
     cfg_env = _contract_driven_provider_config(cmd="dump-env")
-    argv_env, env_off = _build_probe(cfg_env, "1a", tmp_path)
+    argv_env, env_off = _build_probe(cfg_env, "5", tmp_path)
     assert "CLAUDE_CONFIG_DIR" not in env_off
     child_off = subprocess.run(argv_env, cwd=str(scratch), env=env_off,
                                capture_output=True, text=True, check=True)
@@ -413,6 +421,20 @@ def test_every_stage_resolves_permission_mode_and_contract_validates():
         # lists a Bash pattern in its own surface.
         assert not any(str(t).startswith("Bash")
                        for t in allowed + disallowed)
+
+    # The read-only split pinned by the probe (runner/probe_read_only.py):
+    # stages 1a/1b resolve a non-editing mode; every stage that writes its
+    # artifact (2+ writing docs/mcp or the project) resolves acceptEdits.
+    for stage_id in stage_contract.READ_ONLY_STAGES:
+        mode, _, _ = run_stage.stage_permission_surface(stage_id)
+        assert mode != "acceptEdits", \
+            f"read-only stage {stage_id} must not resolve an editing mode"
+    for stage_id in stage_contract.STAGE_ORDER:
+        if stage_id in stage_contract.READ_ONLY_STAGES:
+            continue
+        mode, _, _ = run_stage.stage_permission_surface(stage_id)
+        assert mode == "acceptEdits", \
+            f"artifact-writing stage {stage_id} must resolve acceptEdits"
 
 
 def test_validate_contract_rejects_bad_permission_surface(monkeypatch):
@@ -461,6 +483,19 @@ def test_validate_contract_rejects_bad_permission_surface(monkeypatch):
     no_decline["1a"]["disallowed_tools"] = []
     monkeypatch.setattr(stage_contract, "STAGE_CONTRACT", no_decline)
     with pytest.raises(ValueError, match="must decline WebFetch"):
+        stage_contract.validate_contract()
+
+
+def test_validate_contract_rejects_editing_mode_on_read_only_stage(monkeypatch):
+    """A read-only stage must not silently regain acceptEdits: validate_contract
+    rejects it, keeping the probe-pinned read-only surface intact."""
+    import stage_contract
+
+    pristine = {k: dict(v) for k, v in stage_contract.STAGE_CONTRACT.items()}
+    bad = {k: dict(v) for k, v in pristine.items()}
+    bad["1a"]["permission_mode"] = "acceptEdits"
+    monkeypatch.setattr(stage_contract, "STAGE_CONTRACT", bad)
+    with pytest.raises(ValueError, match="read-only"):
         stage_contract.validate_contract()
 
 

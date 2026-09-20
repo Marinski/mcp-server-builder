@@ -30,13 +30,17 @@ runners:
     # allowed/disallowed tool lists come from runner/stage_contract.py and are
     # emitted through the *_tool_flag flags below.
     #
-    # acceptEdits: a -p session has no TTY to answer a permission prompt, so an
-    # unanswered Write/Edit is silently declined by default — a stage that writes
-    # its own artifact (every stage does) fails closed with no file on disk and
-    # no salvageable output. This is narrower than
-    # --dangerously-skip-permissions: it only auto-accepts file edits, never
-    # arbitrary Bash execution. The value itself comes from the stage contract,
-    # so it can differ per stage.
+    # --permission-mode: a -p session has no TTY to answer a permission prompt,
+    # so an unanswered Write/Edit is silently declined by default — a stage
+    # that needs to write its artifact would fail closed with no file on disk
+    # and no salvageable output. acceptEdits auto-accepts file edits (never
+    # arbitrary Bash execution) and is resolved for the stages that write
+    # project artifacts (2-9). The read-only onboarding stages 1a/1b resolve
+    # the non-editing mode 'default' instead — pinned by the probe in
+    # runner/probe_read_only.py (transcript in scratch-repo/); their
+    # artifact-write exception is approximated, i.e. the stage's output
+    # documents are captured rather than written by its session. The value
+    # itself comes from the stage contract, so it can differ per stage.
     #
     # --settings {settings_file}: the lowest-scope settings come from a file
     # shipped under THIS checkout (runner/settings/claude-settings.json), not
