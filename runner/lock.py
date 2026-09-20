@@ -4,6 +4,15 @@ Acquires ``<docs>/mcp/.run.lock`` containing ``{pid, started_at, mode}``.
 A live-pid check (``os.kill(pid, 0)``) prevents two pipeline runs from
 clobbering each other; a stale lock (dead pid) is reclaimed with a warning.
 
+Acquisition is atomic: a claim is a single ``os.link`` step, so the lock
+path first appears with a complete record in the same atomic operation
+that decides a claim — two claims can never both succeed on the path. A
+stale or unreadable lock is seized with an atomic rename to a private
+quarantine name and only removed after the seized record is checked; a
+live holder's seized record is restored with a guarded link, so a
+reclaimer can never clobber a claim that a rival has just placed. A live
+pid makes ``acquire`` raise ``LockError``.
+
 Usage::
 
     with RunLock(docs_dir, mode="batch") as lock:
@@ -19,6 +28,7 @@ import json
 import os
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -66,26 +76,52 @@ class RunLock:
 
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-        existing = self._read()
-
-        if existing is not None:
-            owner_pid = existing.get("pid")
-            if owner_pid is not None and self._pid_alive(owner_pid):
+        # A claim (os.link) is a single atomic step, so the lock path can
+        # never be won by two claims at once. On FileExistsError the holder
+        # is inspected: a provably live pid is a hard LockError; a stale or
+        # unreadable lock is seized with an atomic rename and the claim
+        # retried. Two passes are enough: a retry claims the lock, observes
+        # the (new) holder's live pid, or re-reclaims a stale/corrupt lock;
+        # if the path is still contended afterwards we fail closed rather
+        # than risk a double holder.
+        for _ in range(2):
+            try:
+                try:
+                    self._claim()
+                except FileExistsError:
+                    existing = self._read()
+                    if existing is not None:
+                        owner_pid = existing.get("pid")
+                        if (type(owner_pid) is int and owner_pid > 0
+                                and self._pid_alive(owner_pid)):
+                            raise LockError(
+                                f"lock held by pid {owner_pid} "
+                                f"(started {existing.get('started_at', '?')}, "
+                                f"mode={existing.get('mode', '?')}); "
+                                f"refusing to acquire"
+                            )
+                        # Stale lock — the owning process is gone.
+                        print(
+                            f"warn: reclaiming stale lock "
+                            f"(dead pid {owner_pid})",
+                            file=sys.stderr,
+                        )
+                    self._reclaim_stale()
+                    continue
+                self._acquired = True
+                return
+            except OSError as exc:
+                # mkstemp/link/rename failed at the filesystem level (e.g.
+                # ENOSPC, EACCES): surface a clean LockError rather than a
+                # raw traceback (run_stage handles only LockError).
                 raise LockError(
-                    f"lock held by pid {owner_pid} "
-                    f"(started {existing.get('started_at', '?')}, "
-                    f"mode={existing.get('mode', '?')}); "
-                    f"refusing to acquire"
-                )
-            # Stale lock — the owning process is gone.
-            print(
-                f"warn: reclaiming stale lock "
-                f"(dead pid {owner_pid})",
-                file=sys.stderr,
-            )
+                    f"cannot acquire {self._lock_path.name}: {exc}"
+                ) from exc
 
-        self._write()
-        self._acquired = True
+        raise LockError(
+            f"could not acquire {self._lock_path.name}: "
+            f"contended by another process"
+        )
 
     def release(self) -> None:
         """Remove the lock file if we own it."""
@@ -105,14 +141,86 @@ class RunLock:
 
     def _read(self) -> dict | None:
         """Read the lock file; return parsed JSON or ``None``."""
+        return self._read_at(self._lock_path)
+
+    def _read_at(self, path: Path) -> dict | None:
+        """Read a lock record file; return parsed JSON or ``None`` (missing,
+        unreadable, or a non-dict payload)."""
         try:
-            raw = self._lock_path.read_text(encoding="utf-8")
-            return json.loads(raw)
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return None
+        return data if isinstance(data, dict) else None
 
-    def _write(self) -> None:
-        """Atomically write the lock file via temp-file + rename."""
+    def _reclaim_stale(self) -> None:
+        """Atomically seize and remove the stale lock at the lock path.
+
+        The current record is re-checked first: a lock whose pid reads as
+        *live* is never moved — the claim arbitration decides against it.
+        Only a stale/corrupt record is seized, by renaming the lock path to
+        a unique quarantine name. If the seized record turns out to be a
+        live holder's anyway (a rival claimed it in the single-syscall
+        window between the re-check and the rename), it is restored with a
+        guarded link — ``os.link`` fails if the path was re-claimed in the
+        gap, so a rival's fresh claim is never clobbered.
+        """
+        existing = self._read()
+        if existing is not None:
+            pid = existing.get("pid")
+            if type(pid) is int and pid > 0 and self._pid_alive(pid):
+                return  # a live holder appeared; do not move its record
+
+        quarantine = self._lock_path.with_name(
+            f"{self._lock_path.name}.stale-"
+            f"{os.getpid()}-{uuid.uuid4().hex}"
+        )
+        try:
+            os.rename(self._lock_path, quarantine)
+        except FileNotFoundError:
+            return  # another reclaimer already removed it
+
+        data = self._read_at(quarantine)
+        if data is not None:
+            pid = data.get("pid")
+            if type(pid) is int and pid > 0 and self._pid_alive(pid):
+                # We seized a live lock in the window between the re-check
+                # above and the rename.
+                try:
+                    os.link(quarantine, self._lock_path)
+                except FileExistsError:
+                    # The path was re-claimed in the gap. The fresh claim is
+                    # left untouched — never clobbered — and the prior live
+                    # holder's record stays under the quarantine name for
+                    # forensics. Residual corner (no purely rename-based
+                    # protocol can prevent it once a live record has been
+                    # physically seized): that prior holder still believes it
+                    # holds the lock, so two _acquired processes can exist;
+                    # the warning names the stranded holder's pid.
+                    print(
+                        f"warn: lock path re-claimed while restoring a live "
+                        f"lock (pid {pid}) during stale cleanup; prior "
+                        f"holder's record left at {quarantine.name}",
+                        file=sys.stderr,
+                    )
+                    return
+                os.unlink(quarantine)
+                return
+        try:
+            quarantine.unlink()
+        except OSError:
+            pass
+
+    def _claim(self) -> None:
+        """Atomically publish our lock record; raise ``FileExistsError`` if
+        the lock path is already taken.
+
+        The record is written to a unique temp file in the lock's directory
+        and then hard-linked into place. The lock path therefore first
+        appears with its *complete* record in the same atomic step that
+        decides the winner — there is never an empty or half-written lock
+        that a competitor could mistake for a stale one.
+        """
         record = {
             "pid": os.getpid(),
             "started_at": datetime.datetime.now(
@@ -127,14 +235,25 @@ class RunLock:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(record, fh, indent=2)
                 fh.write("\n")
-            os.replace(tmp_path, str(self._lock_path))
-        except BaseException:
-            # Clean up the temp file on failure.
+            try:
+                os.link(tmp_path, self._lock_path)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                # Hard links unsupported (or refused): without them we cannot
+                # claim atomically, so fail loudly instead of regressing to a
+                # racy read-then-write.
+                raise LockError(
+                    f"cannot create atomic lock {self._lock_path.name}: "
+                    f"{exc}"
+                ) from exc
+        finally:
+            # On success tmp_path and _lock_path are the same inode; drop the
+            # temp name. On failure the temp file must not be left behind.
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-            raise
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
