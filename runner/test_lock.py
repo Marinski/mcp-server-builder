@@ -58,6 +58,47 @@ def test_reclaims_stale_lock_with_dead_pid(tmp_path: Path, capsys) -> None:
     assert not list(tmp_path.glob(".run.lock.stale-*"))  # no quarantine litter
 
 
+@pytest.mark.parametrize("bad_pid", [0, -1, False, True, "123", 1.5, None])
+def test_reclaims_lock_with_invalid_pid(
+    tmp_path: Path, capsys, bad_pid
+) -> None:
+    # An invalid pid is never a live holder, so the lock is stale/invalid and
+    # the current process must be able to proceed. Without validation, pid 0
+    # would probe the caller's process group and bools would degenerate to
+    # pid 0/1 — both falsely "alive" under os.kill(pid, 0).
+    (tmp_path / ".run.lock").write_text(
+        json.dumps({"pid": bad_pid, "started_at": "earlier",
+                    "mode": "batch"}),
+        encoding="utf-8",
+    )
+    lock = RunLock(tmp_path, mode="status")
+    lock.acquire()
+    try:
+        rec = json.loads((tmp_path / ".run.lock").read_text(encoding="utf-8"))
+        assert rec["pid"] == os.getpid()
+        assert rec["mode"] == "status"
+    finally:
+        lock.release()
+    assert "reclaiming stale lock" in capsys.readouterr().err
+    assert not list(tmp_path.glob(".run.lock.stale-*"))  # no quarantine litter
+
+
+@pytest.mark.parametrize("bad_pid", [0, True, None])
+def test_reclaim_stale_treats_invalid_pid_as_stale(
+    tmp_path: Path, bad_pid
+) -> None:
+    # The stale-cleanup guard must not refuse to seize a lock whose pid is
+    # invalid (e.g. 0): unlike a live holder, nothing protects it.
+    (tmp_path / ".run.lock").write_text(
+        json.dumps({"pid": bad_pid, "started_at": "now", "mode": "batch"}),
+        encoding="utf-8",
+    )
+    lock = RunLock(tmp_path)
+    lock._reclaim_stale()  # white-box: exercise the guard directly
+    assert not (tmp_path / ".run.lock").exists()  # seized and removed
+    assert not list(tmp_path.glob(".run.lock.stale-*"))  # quarantine cleaned
+
+
 def test_reclaims_corrupt_lock_file(tmp_path: Path) -> None:
     (tmp_path / ".run.lock").write_text("{not json!", encoding="utf-8")
     lock = RunLock(tmp_path)
@@ -207,6 +248,35 @@ def test_concurrent_acquirers_have_single_winner(tmp_path: Path) -> None:
     rec = json.loads((tmp_path / ".run.lock").read_text(encoding="utf-8"))
     assert rec["pid"] > 0
     assert rec["mode"] == "probe"
+
+
+def test_pid_alive_requires_positive_int() -> None:
+    # Live-pid probing is only meaningful for a positive integer: anything
+    # else is 'not alive' so lock arbitration treats the record as
+    # stale/invalid instead of minting a live holder for pid 0 / bools /
+    # floats / strings / oversized ints.
+    assert RunLock._pid_alive(os.getpid())  # genuinely live process
+    for bad_pid in (0, -1, False, True, 1.5, "123", None, 2**100):
+        assert RunLock._pid_alive(bad_pid) is False
+
+
+def test_pid_alive_never_probes_unsafe_pids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The safety property behind the validation: a pid that would make
+    # os.kill *succeed* against the wrong target (0 = own process group,
+    # -1 = broadcast, True = pid 1) or crash on a non-int must never be
+    # probed at all — the guard has to reject it before os.kill sees it.
+    probed: list[object] = []
+
+    def _tracking_kill(pid: object, sig: object) -> None:
+        probed.append(pid)
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", _tracking_kill)
+    for bad_pid in (0, -1, False, True, 1.5, "123", None):
+        assert RunLock._pid_alive(bad_pid) is False
+    assert probed == []
 
 
 def _dead_pid() -> int:

@@ -3,6 +3,10 @@
 Acquires ``<docs>/mcp/.run.lock`` containing ``{pid, started_at, mode}``.
 A live-pid check (``os.kill(pid, 0)``) prevents two pipeline runs from
 clobbering each other; a stale lock (dead pid) is reclaimed with a warning.
+Only a positive integer pid that provably names a running process counts
+as live; an invalid pid (0, negative, oversized, bool, non-int, or missing)
+is treated as stale/invalid and reclaimed, so a corrupt record can never
+block the current process.
 
 Acquisition is atomic: a claim is a single ``os.link`` step, so the lock
 path first appears with a complete record in the same atomic operation
@@ -92,18 +96,22 @@ class RunLock:
                     existing = self._read()
                     if existing is not None:
                         owner_pid = existing.get("pid")
-                        if (type(owner_pid) is int and owner_pid > 0
-                                and self._pid_alive(owner_pid)):
+                        # A positive integer pid with a genuinely running
+                        # process is a hard LockError; anything else (dead
+                        # process, pid 0/negative/non-int/missing) is a
+                        # stale or invalid lock the current process may take
+                        # over.
+                        if self._pid_alive(owner_pid):
                             raise LockError(
                                 f"lock held by pid {owner_pid} "
                                 f"(started {existing.get('started_at', '?')}, "
                                 f"mode={existing.get('mode', '?')}); "
                                 f"refusing to acquire"
                             )
-                        # Stale lock — the owning process is gone.
+                        # Stale or invalid lock — no live owner to defer to.
                         print(
                             f"warn: reclaiming stale lock "
-                            f"(dead pid {owner_pid})",
+                            f"(pid {owner_pid} not alive)",
                             file=sys.stderr,
                         )
                     self._reclaim_stale()
@@ -168,7 +176,7 @@ class RunLock:
         existing = self._read()
         if existing is not None:
             pid = existing.get("pid")
-            if type(pid) is int and pid > 0 and self._pid_alive(pid):
+            if self._pid_alive(pid):
                 return  # a live holder appeared; do not move its record
 
         quarantine = self._lock_path.with_name(
@@ -183,7 +191,7 @@ class RunLock:
         data = self._read_at(quarantine)
         if data is not None:
             pid = data.get("pid")
-            if type(pid) is int and pid > 0 and self._pid_alive(pid):
+            if self._pid_alive(pid):
                 # We seized a live lock in the window between the re-check
                 # above and the rename.
                 try:
@@ -256,8 +264,22 @@ class RunLock:
                 pass
 
     @staticmethod
-    def _pid_alive(pid: int) -> bool:
-        """Return True if *pid* is a running process."""
+    def _pid_alive(pid: object) -> bool:
+        """Return True only if *pid* is a positive integer naming a running
+        process.
+
+        Invalid pids — non-int values, bools, zero, negatives, and integers
+        past the platform's pid range — are reported dead rather than
+        probed. Probing them would be unsafe or meaningless: ``os.kill(0,
+        0)`` signals the caller's own process group, ``os.kill(-1, 0)``
+        broadcasts to every signalable process, a bool degenerates to pid
+        0/1, a non-int pid raises TypeError, and an oversized pid raises
+        OverflowError. Treating them as dead lets lock arbitration classify
+        the record as stale/invalid and reclaim it instead of minting a live
+        holder.
+        """
+        if type(pid) is not int or pid <= 0:
+            return False
         try:
             os.kill(pid, 0)
             return True
@@ -266,3 +288,7 @@ class RunLock:
         except PermissionError:
             # Process exists but we lack signal permission — still alive.
             return True
+        except (OverflowError, ValueError):
+            # Outside the platform's pid_t range — cannot name a real
+            # process, so it is invalid rather than alive.
+            return False
