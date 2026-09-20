@@ -66,6 +66,7 @@ Every stage writes exactly these files. Later stages read them instead of re-cra
   05-test-plan.md            # 6  — test strategy
   06-review.md               # 7  — hardening findings
   07-release.md              # 8  — install/config instructions
+  08-retro.md                # 9  — proposed playbook edits (reviewable; human applies + PR)
 ```
 
 ---
@@ -643,7 +644,19 @@ the code wins and you note the drift.
 
 ## Stage 9 — Capture what the pipeline got wrong
 
-Run once at the end, while it is fresh.
+Run once at the end, while it is fresh. **Writes:** `08-retro.md`.
+
+Stage 9 **proposes**; it does not apply. The deliverable is a reviewable retro artifact in
+`{{DOCS}}/08-retro.md`; applying the proposed playbook edits and upstreaming them is a human
+action, through the same commit/PR flow the README describes. The stage never writes into
+the mcp-server-builder installation itself.
+
+> **The playbook is not writable from a stage.** This stage runs against a cloned target repo
+> — possibly one whose contents you do not fully control — and the playbook drives every
+> future run. Letting the retro write revised prompt text directly into it would let the
+> wrapped repo steer the pipeline into persisting attacker-chosen instructions in the file
+> that runs next time. The retro's output is an input to a human decision, so it lands in the
+> target repo's artifact dir (`{{DOCS}}/08-retro.md`) and a human applies it.
 
 ```
 Use the pskoett-ai-skills:self-improvement skill. If that skill is not registered in this
@@ -655,8 +668,17 @@ Review this MCP server build end to end. Capture, as durable learnings:
 - Anything about MCP or {{LANG}} SDK behaviour that contradicted an agent's assumptions.
 - Which prompts in this playbook should change for the next project — quote the exact edit.
 
-Then write the revised prompt text back into
-<path-to>/mcp-server-builder/mcp-server-creation-workflow.md.
+Write the result to {{DOCS}}/08-retro.md:
+- one section per proposed playbook edit, each quoting the current text and the exact
+  replacement (old → new) plus a one-line reason, so a maintainer can apply each edit by
+  hand;
+- one section listing the durable learnings above;
+- then STOP.
+
+Do not apply any of the proposed edits. Do not edit any file outside {{DOCS}} — in
+particular nothing in the mcp-server-builder installation (the playbook, runner, agents,
+templates, or config). Updating the canonical playbook is a human action: the maintainer
+applies the proposed edits and upstreams them through the normal commit/PR flow.
 ```
 
 ---
@@ -675,7 +697,7 @@ Then write the revised prompt text back into
 | 6 | Test L1–L4 | Test Automation Engineer | `engineering:testing-strategy` | `05-test-plan.md`, tests | Inspector smoke passes |
 | 7 | Harden | Code Reviewer + AppSec Engineer + Minimal Change Engineer | `engineering:code-review`, `pskoett-ai-skills:simplify-and-harden` | `06-review.md` | HIGH+ findings fixed |
 | 8 | Package | Technical Writer | `engineering:documentation` | `README.md`, `07-release.md` | real client, real task |
-| 9 | Retro | — | `pskoett-ai-skills:self-improvement` | updated playbook | — |
+| 9 | Retro | — | `pskoett-ai-skills:self-improvement` | `08-retro.md` | human applies proposed edits |
 
 ### Rules that make this work
 

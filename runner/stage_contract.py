@@ -57,7 +57,7 @@ SHAPE_NO_CHECKABLE = "no-checkable-artifact"
 # ── TODO (Spec 1 wiring plan, Track B items 6-7) ──────────────────────────
 # When Spec 1 merges, the runner gains an expected-artifact-shape check:
 #
-#   • Each single-file stage (1a, 1b, 2, 3, 4, 7) registers its template
+#   • Each single-file stage (1a, 1b, 2, 3, 4, 7, 9) registers its template
 #     path (e.g. templates/01-instructions.md for stage 1a) as the
 #     expected-artifact-shape entry in the runner.  The check compares
 #     the target artifact's mtime + size against the template, computed
@@ -66,12 +66,14 @@ SHAPE_NO_CHECKABLE = "no-checkable-artifact"
 #   • Stage 5 registers as directory-or-phase-based (SHAPE_PHASE_TRACKED):
 #     no single-file template match; completion is tracked per phase N/M.
 #
-#   • Stage 9 is EXPLICITLY EXEMPT from the artifact-path check and must
-#     never receive a docs/mcp/09-retro.md template.  Stage 9 patches
-#     this repo's own workflow file (mcp-server-creation-workflow.md),
-#     not a target project's docs/mcp/ — so a naive per-stage template
-#     check would either false-positive or force a wrong template.
-#     SHAPE_NO_CHECKABLE is its permanent shape.
+#   • Stage 9 used to be EXPLICITLY EXEMPT from the artifact-path check,
+#     because it patched this repo's own workflow file
+#     (mcp-server-creation-workflow.md) rather than producing a docs/mcp/
+#     artifact. That is no longer the case: the retro now writes
+#     templates/08-retro.md to {{DOCS}}/08-retro.md as a reviewable
+#     artifact, so stage 9 is tracked exactly like the other single-file
+#     stages. Only stages 5 (phase-tracked) and 6/8 (multi-file) are not
+#     single-file-checked.
 #
 # Until Spec 1 merges this is a documentation-only no-op.
 # ───────────────────────────────────────────────────────────────────────────
@@ -186,9 +188,9 @@ STAGE_CONTRACT: dict[str, dict] = {
         "disallowed_tools": ["WebFetch(*)"],
     },
     "9": {
-        "artifact_shape": SHAPE_NO_CHECKABLE,
+        "artifact_shape": SHAPE_SINGLE_FILE,
         "preflight_inputs": [],
-        "postflight_outputs": [],
+        "postflight_outputs": ["08-retro.md"],
         "human_gated": False,
         "permission_mode": "acceptEdits",
         "disallowed_tools": ["WebFetch(*)"],

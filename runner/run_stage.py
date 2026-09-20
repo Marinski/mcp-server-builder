@@ -66,7 +66,7 @@ def build_outputs(stage: str, docs: Path | None) -> list[dict]:
     Returns a list of objects, one per tracked output file:
         {path, shape, exists, size, mtime}
 
-    Empty array for stage 9 (no-checkable-artifact) and when --docs is not given.
+    Empty array when --docs is not given.
     """
     # Import here to avoid circular imports; matches the existing pattern.
     from stage_contract import STAGE_CONTRACT, SHAPE_NO_CHECKABLE  # type: ignore[import]
@@ -96,11 +96,8 @@ def preflight_check(stage: str, docs: Path | None,
                     manifest_path: Path | None = None) -> None:
     """Verify required input artifacts exist on disk before spawning a subprocess.
 
-    Stage 9 requires no pre-flight check.
     Stage 5 additionally validates --phase N/M and M consistency.
     """
-    if stage == "9":
-        return
     if docs is None:
         return
 
@@ -149,9 +146,8 @@ def postflight_check(stage: str, docs: Path | None,
     """After a successful run, record exists/size/mtime for tracked output paths.
 
     Stage 5: skip existence check (completion = ok attempt for phase N/M).
-    Stage 9: skip entirely (returns empty).
     """
-    if stage == "9" or docs is None:
+    if docs is None:
         return outputs
 
     from stage_contract import STAGE_CONTRACT  # type: ignore[import]
@@ -658,7 +654,7 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
       duration_s   – wall-clock seconds for the subprocess
       timed_out    – True when the process was killed by timeout
       phase        – 'N/M' string, stage 5 only
-      outputs      – [{path, shape, exists, size, mtime}], empty array for stage 9
+      outputs      – [{path, shape, exists, size, mtime}]
       log_path     – path to the tee'd log file (if given)
       output_tail  – last ~50 lines of stdout+stderr (if captured)
     """
@@ -732,7 +728,7 @@ def detect_drift(stage: str, manifest_path: Path | None) -> list[dict]:
       {path, expected_size, actual_size, expected_mtime, actual_mtime}
     Empty list when no drift is detected (or no tracked outputs exist).
     """
-    if stage in ("5", "9"):
+    if stage == "5":
         return []
 
     rec = _last_ok_record(stage, manifest_path)
