@@ -132,6 +132,19 @@ a minimal child environment — `PATH`, `HOME`, locale (`LANG`/`LC_*`), plus `SY
 base URL. An unrelated secret you happen to have exported (an `AWS_SECRET_ACCESS_KEY`,
 a `GITHUB_TOKEN`) is not handed to the stage agent.
 
+A secret that *is* handed to the stage agent (the resolved provider credential, or an
+opt-in `pass_env` value whose name looks credential-shaped) can still turn up in the
+stage's own stdout/stderr — a verbose auth-failure message, for instance. `redact()`
+(`runner/run_stage.py`) masks it before it reaches the console, the tee'd log under
+`docs/mcp/logs`, or `run-manifest.jsonl`'s `output_tail`, replacing it with a stable
+`[REDACTED:VAR_NAME]` placeholder. It also masks common credential shapes it wasn't
+told about ahead of time (`sk-…`, `ghp_…`/`github_pat_…`, AWS access key ids, Slack
+tokens, bearer tokens, PEM private-key blocks) — a secret a stage's own tool calls
+mint mid-run, not just the one this runner injected. This narrows exposure; it does
+not eliminate it — treat `docs/mcp/logs` and `run-manifest.jsonl` as containing
+non-secret project output that may still be sensitive, and see Sandboxing below for
+the boundary redaction does not replace.
+
 Inspect what a stage would run, without calling anything:
 
 ```bash

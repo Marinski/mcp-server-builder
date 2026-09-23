@@ -253,10 +253,63 @@ def safe_open(path: Path | str, mode: str, *, root: Path | str | None = None,
     return os.fdopen(fd, mode, encoding="utf-8")
 
 
+# Generic credential-shaped patterns, matched even when the exact value
+# isn't known ahead of time (a secret minted by the stage's own tool calls,
+# not just the one this runner injected). Deliberately narrow enough not to
+# mangle non-secret content like a git SHA or a long hex hash.
+_SECRET_PATTERNS = [
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),              # OpenAI/Anthropic-style
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),          # GitHub PAT/OAuth/app tokens
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),        # GitHub fine-grained PAT
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),           # AWS access key id
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),        # Slack tokens
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{10,}"),      # Bearer <token>
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+               r".*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
+]
+
+# Env var *names* that look credential-shaped, regardless of provenance
+# (the resolved provider credential lands on runner['api_key_var'], e.g.
+# OPENAI_API_KEY/ANTHROPIC_API_KEY; a pass_env entry like GITHUB_TOKEN
+# matches the same way). HTTPS_PROXY or PATH do not match.
+_SECRET_ENV_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
+
+
+def secret_values_from_env(env: dict) -> dict[str, str]:
+    """Env entries whose *name* looks credential-shaped, for redact().
+
+    Called on the child env build_command already resolved, so it covers
+    both the injected provider credential and any pass_env value the
+    operator opted into, without redact() needing to know which is which.
+    """
+    return {name: value for name, value in env.items()
+            if value and _SECRET_ENV_NAME.search(name)}
+
+
+def redact(text: str, secret_values: dict[str, str] | None = None) -> str:
+    """Mask known secret values and generic credential-shaped patterns.
+
+    ``secret_values`` maps an env var name to its value (typically from
+    :func:`secret_values_from_env`); each occurrence is replaced with a
+    stable ``[REDACTED:NAME]`` placeholder so redacted output stays
+    diffable. Generic credential shapes are masked even when the exact
+    value wasn't known ahead of time (findings 5388, 5406, 5411, 5416).
+    """
+    for name, value in (secret_values or {}).items():
+        if value:
+            text = text.replace(value, f"[REDACTED:{name}]")
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
+
+
 class LogCapture:
     """Tee stdout+stderr to a log file while streaming to console.
 
-    Records the last ~50 lines as output_tail for the manifest.
+    Records the last ~50 lines as output_tail for the manifest. Every write
+    is redacted first (:func:`redact`), so neither the console stream, the
+    persisted log file, nor the in-memory tail can carry a known secret
+    value or a generic credential-shaped string.
     Used as a context manager: returns (log_path_str, output_tail_str).
     Falls back to (None, None) when --docs is not given.
     """
@@ -264,10 +317,12 @@ class LogCapture:
     TAIL_LINES = 50
 
     def __init__(self, stage: str, docs: Path | None,
-                 phase: str | None = None) -> None:
+                 phase: str | None = None,
+                 secret_values: dict[str, str] | None = None) -> None:
         self.stage = stage
         self.docs = docs
         self.phase = phase
+        self.secret_values = secret_values
         self._fh = None
         self._log_path = None
         self._tail_lines: list[str] = []
@@ -294,7 +349,8 @@ class LogCapture:
         return self._log_path, self
 
     def write(self, text: str) -> None:
-        """Write text to both console (stderr) and log file."""
+        """Write text to both console (stderr) and log file, redacted."""
+        text = redact(text, self.secret_values)
         sys.stderr.write(text)
         sys.stderr.flush()
         if self._fh:
@@ -641,7 +697,8 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
                     phase: str | None = None,
                     outputs: list[dict] | None = None,
                     log_path: str | None = None,
-                    output_tail: str | None = None) -> None:
+                    output_tail: str | None = None,
+                    secret_values: dict[str, str] | None = None) -> None:
     """Append what actually ran to a manifest.
 
     An artifact does not record which model produced it, so a run is otherwise
@@ -657,7 +714,15 @@ def record_attempt(args, attempt: dict, index: int, total: int, returncode: int,
       outputs      – [{path, shape, exists, size, mtime}]
       log_path     – path to the tee'd log file (if given)
       output_tail  – last ~50 lines of stdout+stderr (if captured)
+
+    ``output_tail`` is redacted again here (:func:`redact`), even though a
+    caller sourced from :class:`LogCapture` already redacted it on the way
+    in: this is the last stop before the value is durably persisted to the
+    manifest, so it stays safe even if a future caller passes an
+    unredacted tail directly (findings 5388, 5406, 5411, 5416).
     """
+    if output_tail is not None:
+        output_tail = redact(output_tail, secret_values)
     path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
     if path is None:
         return
@@ -797,6 +862,7 @@ def run_stage_once(stage: str, cfg: dict, args: argparse.Namespace,
             print(f"  skip {attempt['provider']}/{attempt['model']}: "
                   f"'{exc}' not on PATH", file=sys.stderr)
             continue
+        secret_values = secret_values_from_env(env)
 
         label = f"{attempt['provider']}/{attempt['model']}"
         print(f"  [{i + 1}/{len(chain)}] running {label}", file=sys.stderr)
@@ -805,7 +871,7 @@ def run_stage_once(stage: str, cfg: dict, args: argparse.Namespace,
         t_start = time.monotonic()
         log_path = None
         output_tail = None
-        with LogCapture(stage, args.docs, phase) as (lp, lc):
+        with LogCapture(stage, args.docs, phase, secret_values) as (lp, lc):
             log_path = lp
             try:
                 proc = subprocess.Popen(
@@ -822,7 +888,7 @@ def run_stage_once(stage: str, cfg: dict, args: argparse.Namespace,
                     if lc is not None:
                         lc.write(line)
                     else:
-                        sys.stderr.write(line)
+                        sys.stderr.write(redact(line, secret_values))
                         sys.stderr.flush()
                 proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
@@ -841,7 +907,8 @@ def run_stage_once(stage: str, cfg: dict, args: argparse.Namespace,
         record_attempt(args, attempt, i, len(chain), proc.returncode,
                        duration_s=duration_s, timed_out=timed_out,
                        phase=phase, outputs=postflight,
-                       log_path=log_path, output_tail=tail)
+                       log_path=log_path, output_tail=tail,
+                       secret_values=secret_values)
         if proc.returncode == 0:
             print(f"  ok: {label}", file=sys.stderr)
             return 0
@@ -1213,6 +1280,7 @@ def main() -> int:
             print(f"  skip {attempt['provider']}/{attempt['model']}: '{exc}' not on PATH",
                   file=sys.stderr)
             continue
+        secret_values = secret_values_from_env(env)
 
         label = f"{attempt['provider']}/{attempt['model']}"
         if args.dry_run:
@@ -1225,7 +1293,7 @@ def main() -> int:
         t_start = time.monotonic()
         log_path = None
         output_tail = None
-        with LogCapture(args.stage, args.docs, args.phase) as (lp, lc):
+        with LogCapture(args.stage, args.docs, args.phase, secret_values) as (lp, lc):
             log_path = lp
             try:
                 proc = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE,
@@ -1241,7 +1309,7 @@ def main() -> int:
                     if lc is not None:
                         lc.write(line)
                     else:
-                        sys.stderr.write(line)
+                        sys.stderr.write(redact(line, secret_values))
                         sys.stderr.flush()
                 proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
@@ -1259,7 +1327,8 @@ def main() -> int:
         record_attempt(args, attempt, i, len(chain), proc.returncode,
                         duration_s=duration_s, timed_out=timed_out,
                         phase=args.phase, outputs=postflight,
-                        log_path=log_path, output_tail=tail)
+                        log_path=log_path, output_tail=tail,
+                        secret_values=secret_values)
         if proc.returncode == 0:
             print(f"  ok: {label}", file=sys.stderr)
             return 0

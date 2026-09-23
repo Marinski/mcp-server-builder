@@ -670,6 +670,167 @@ def test_runner_artifacts_normal_run_unaffected(tmp_path):
     assert records[0]["log_path"] == str(log)
 
 
+# ── redact() and secret scrubbing (findings 5388, 5406, 5411, 5416) ───────
+
+
+def test_redact_masks_a_known_secret_value():
+    text = "auth failed for key sk-live-abcdef1234567890 on request"
+    out = run_stage.redact(text, {"OPENAI_API_KEY": "sk-live-abcdef1234567890"})
+    assert "sk-live-abcdef1234567890" not in out
+    assert "[REDACTED:OPENAI_API_KEY]" in out
+
+
+def test_redact_masks_generic_credential_shapes_without_a_known_value():
+    # These are secrets the runner never injected (e.g. minted by the
+    # stage's own tool calls) and so cannot be in secret_values — redact()
+    # must still catch the shape.
+    samples = {
+        "sk-ant-api03-abcdefghijklmnopqrstuvwx": "openai/anthropic-style key",
+        "ghp_abcdefghijklmnopqrstuvwxyz012345": "github PAT",
+        "github_pat_11ABCDEFG0abcdefghijklmnop": "github fine-grained PAT",
+        "AKIAABCDEFGHIJKLMNOP": "AWS access key id",
+        "xoxb-test-fixture-not-a-real-token": "slack token",
+        "Bearer abcdefghijklmnopqrstuvwx": "bearer token",
+    }
+    for secret, label in samples.items():
+        out = run_stage.redact(f"line before {secret} line after")
+        assert secret not in out, f"{label} leaked through redact()"
+        assert "[REDACTED]" in out
+
+
+def test_redact_masks_pem_private_key_block():
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIBOgIBAAJBAK...\n"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    out = run_stage.redact(f"leaked cred:\n{pem}\ndone")
+    assert "MIIBOgIBAAJBAK" not in out
+    assert "[REDACTED]" in out
+
+
+def test_redact_leaves_non_secret_content_unchanged():
+    """A control string that merely looks credential-adjacent (a git SHA,
+    ordinary prose) must pass through untouched — a redactor that mangles
+    valid output is its own failure mode."""
+    text = "commit abc123def456 fixed the build; see PATH=/usr/bin"
+    assert run_stage.redact(text) == text
+
+
+def test_secret_values_from_env_matches_credential_shaped_names_only():
+    env = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/stub",
+        "HTTPS_PROXY": "http://proxy.internal:3128",
+        "OPENAI_API_KEY": "sk-live-abcdef1234567890",
+        "GITHUB_TOKEN": "ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "DB_PASSWORD": "hunter2",
+    }
+    secrets = run_stage.secret_values_from_env(env)
+    assert secrets == {
+        "OPENAI_API_KEY": "sk-live-abcdef1234567890",
+        "GITHUB_TOKEN": "ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "DB_PASSWORD": "hunter2",
+    }
+
+
+def test_log_capture_redacts_secret_values_before_writing_log_and_tail(tmp_path):
+    """The injected provider credential must not reach the persisted log
+    file or the in-memory tail, even though LogCapture only ever sees
+    already-decoded subprocess output — not the env dict directly."""
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+    secret_values = {"OPENAI_API_KEY": "sk-live-abcdef1234567890"}
+
+    with run_stage.LogCapture("1a", docs, secret_values=secret_values) as (log_path, lc):
+        lc.write("auth header: sk-live-abcdef1234567890\n")
+        assert "sk-live-abcdef1234567890" not in lc.tail()
+        assert "[REDACTED:OPENAI_API_KEY]" in lc.tail()
+
+    logged = Path(log_path).read_text(encoding="utf-8")
+    assert "sk-live-abcdef1234567890" not in logged
+    assert "[REDACTED:OPENAI_API_KEY]" in logged
+
+
+def test_log_capture_redacts_console_stream(tmp_path, capsys):
+    """The console (stderr) stream is redacted too, not just the file."""
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+    secret_values = {"OPENAI_API_KEY": "sk-live-abcdef1234567890"}
+
+    with run_stage.LogCapture("1a", docs, secret_values=secret_values) as (_, lc):
+        lc.write("auth header: sk-live-abcdef1234567890\n")
+
+    err = capsys.readouterr().err
+    assert "sk-live-abcdef1234567890" not in err
+    assert "[REDACTED:OPENAI_API_KEY]" in err
+
+
+def test_record_attempt_redacts_output_tail_before_persisting(tmp_path):
+    """A tail that somehow still carries a secret (e.g. a future caller that
+    bypasses LogCapture) is redacted again at the last stop before it is
+    durably written to the manifest."""
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+    attempt = {"provider": "stub", "model": "stub-model"}
+
+    run_stage.record_attempt(
+        _record_args(docs), attempt, 0, 1, 0,
+        duration_s=1.0, timed_out=False,
+        output_tail="token leaked: sk-live-abcdef1234567890",
+        secret_values={"OPENAI_API_KEY": "sk-live-abcdef1234567890"})
+
+    manifest = docs / "run-manifest.jsonl"
+    record = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+    assert "sk-live-abcdef1234567890" not in record["output_tail"]
+    assert "[REDACTED:OPENAI_API_KEY]" in record["output_tail"]
+
+
+def test_end_to_end_stage_run_never_persists_the_provider_credential(tmp_path, monkeypatch):
+    """A real subprocess that echoes the provider credential to stdout (the
+    exact scenario in findings 5388/5406/5411/5416 — a CLI's own verbose or
+    error output echoing its auth header) must not leave that value in
+    either the log file or the manifest."""
+    stub = tmp_path / "echo-secret"
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "print('connecting with key', os.environ['OPENAI_API_KEY'])\n",
+        encoding="utf-8",
+    )
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join([str(tmp_path), os.environ.get("PATH", "")]))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("STUB_API_KEY", "sk-live-abcdef1234567890")
+    monkeypatch.setenv("STUB_BASE_URL", "https://stub.invalid/v1")
+
+    docs = tmp_path / "docs" / "mcp"
+    docs.mkdir(parents=True)
+    cfg = _provider_config(runner_overrides={"cmd": "echo-secret"})
+    attempt = {"provider": "stubby", "model": "stub-model"}
+    argv, env = run_stage.build_command(
+        cfg, attempt, "1a", tmp_path / "prompt.txt", [], strict=True)
+    secret_values = run_stage.secret_values_from_env(env)
+
+    with run_stage.LogCapture("1a", docs, secret_values=secret_values) as (log_path, lc):
+        proc = subprocess.run(argv, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        lc.write(proc.stdout.decode("utf-8"))
+        tail = lc.tail()
+
+    run_stage.record_attempt(
+        _record_args(docs), attempt, 0, 1, proc.returncode,
+        duration_s=1.0, timed_out=False, log_path=log_path,
+        output_tail=tail, secret_values=secret_values)
+
+    logged = Path(log_path).read_text(encoding="utf-8")
+    manifest_record = json.loads(
+        (docs / "run-manifest.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert "sk-live-abcdef1234567890" not in logged
+    assert "sk-live-abcdef1234567890" not in manifest_record["output_tail"]
+
+
 # ── new-project.sh symlink-safe writes (finding 5405) ─────────────────────
 
 
