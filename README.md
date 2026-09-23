@@ -63,9 +63,13 @@ The split that keeps this clean:
 | playbook, agents, config schema, runner | `docs/mcp/*` artifacts |
 | improvements, upstreamed by PR | the generated `mcp-server/` |
 
-Stage 9 (the retro) edits the **playbook**, so its output is a commit in the
-submodule. That is intended — improvements flow upstream and every consuming repo
-picks them up on the next bump. Never commit a client's capability inventory here.
+Stage 9 (the retro) **proposes** playbook edits; it does not apply them. Its
+deliverable is `docs/mcp/08-retro.md` inside the project being wrapped — applying the
+proposed edits and upstreaming them as a PR is a human action, and every consuming
+repo picks the improvements up on the next bump. The stage is instructed never to write
+into this installation (see `mcp-server-creation-workflow.md` §Stage 9 and
+"Non-interactive sessions and permissions" below). Never commit a client's capability
+inventory here.
 
 ## Model routing
 
@@ -93,7 +97,7 @@ Two runners, because they reach different things:
 |---|---|---|---|
 | API shape | Anthropic (`/v1/messages`) | OpenAI-compatible | OpenAI / Anthropic / Google |
 | provider selection | none — endpoint only | folded into `provider/model` | **separate `--provider` flag** |
-| credential | env var | env var | **`--api-key` flag** |
+| credential | env var | env var | env var via the provider's `api_key_env` |
 | skills / personas | native | via skill autodiscovery | its own extension system |
 | fallback chain | native, same provider only | handled by this repo's runner | handled by this repo's runner |
 
@@ -101,8 +105,13 @@ Anything OpenAI-compatible works through `opencode` or `pi` — LiteLLM, vLLM, O
 OpenRouter, a vendor API.
 
 [`pi`](https://github.com/earendil-works/pi) is the cleanest fit of the three: it takes
-provider, model and key as separate flags rather than requiring env-var juggling, and
-`--mode json` is genuinely non-interactive. Install it either way:
+provider and model as separate flags, and `--mode json` is genuinely non-interactive.
+The credential is **not** one of those flags: the runner supplies it through the
+provider's `api_key_env` (see `models.example.yaml`), exactly like the other two
+runners. Never put a key on a command line — argv is exposed via `ps` and shell
+history. If a runner build genuinely requires a key flag, treat it as unsupported
+here and route the credential through the config's env-var indirection instead.
+Install either way:
 
 ```bash
 npm i -g @earendil-works/pi-coding-agent        # simplest; provides `pi`
@@ -116,6 +125,25 @@ review (their own supply-chain posture is worth matching), or when you want thei
 
 Endpoints and keys are read from **environment variables named in the config**, never
 stored in it, so `models.yaml` never contains a URL or secret.
+
+The stage CLI does not inherit the invoking shell's whole environment. The runner builds
+a minimal child environment — `PATH`, `HOME`, locale (`LANG`/`LC_*`), plus `SYSTEMROOT`,
+`TEMP` and `USERPROFILE` on Windows — and overlays only the resolved provider's key and
+base URL. An unrelated secret you happen to have exported (an `AWS_SECRET_ACCESS_KEY`,
+a `GITHUB_TOKEN`) is not handed to the stage agent.
+
+A secret that *is* handed to the stage agent (the resolved provider credential, or an
+opt-in `pass_env` value whose name looks credential-shaped) can still turn up in the
+stage's own stdout/stderr — a verbose auth-failure message, for instance. `redact()`
+(`runner/run_stage.py`) masks it before it reaches the console, the tee'd log under
+`docs/mcp/logs`, or `run-manifest.jsonl`'s `output_tail`, replacing it with a stable
+`[REDACTED:VAR_NAME]` placeholder. It also masks common credential shapes it wasn't
+told about ahead of time (`sk-…`, `ghp_…`/`github_pat_…`, AWS access key ids, Slack
+tokens, bearer tokens, PEM private-key blocks) — a secret a stage's own tool calls
+mint mid-run, not just the one this runner injected. This narrows exposure; it does
+not eliminate it — treat `docs/mcp/logs` and `run-manifest.jsonl` as containing
+non-secret project output that may still be sensitive, and see Sandboxing below for
+the boundary redaction does not replace.
 
 Inspect what a stage would run, without calling anything:
 
@@ -137,21 +165,72 @@ exactly the stages where weak models degrade quietly.
 ### Non-interactive sessions and permissions
 
 A `-p` stage session has no TTY to answer a permission prompt, so anything that would
-prompt is **declined by default**. Three consequences, each found the hard way:
+prompt is **declined by default**. Four consequences, each found the hard way:
 
 - **Working directory.** Claude Code confines file access to the directory it is launched
   from. The runner therefore launches every stage with the *target repo* as its working
   directory (derived from `--docs`, or set explicitly with `--cwd`) — otherwise a stage
   invoked from this repo is silently sandboxed out of the repo it is meant to read and write.
 - **File writes.** Every stage writes its own artifact; without `--permission-mode
-  acceptEdits` the declined Write leaves the stage exiting 0 with no file on disk and the
-  document unrecoverable. The shipped `models.example.yaml` passes it. Deliberately not
+  acceptEdits` the declined Write leaves the stage exiting 0 with no file on disk and
+  the document unrecoverable. The runner passes `--permission-mode` per stage from the stage
+  contract (`runner/stage_contract.py`): stages that write project artifacts (2-9) resolve
+  `acceptEdits`, while the onboarding stages 1a/1b are pinned **read-only** and resolve the
+  non-editing mode `default` (see `mcp-server-creation-workflow.md` §Stage 1). The read-only
+  enforcement is probed by `runner/probe_read_only.py`, whose transcript is committed under
+  `scratch-repo/probe-read-only-transcript.md`: the read-only stage cannot create a file
+  outside `docs/mcp`, the write stages can. Because a read-only stage cannot auto-accept even
+  its own artifact write, that write-exception is approximated — `01-instructions.md` /
+  `01-signatures.md` are captured from the stage's output. Deliberately not
   `--dangerously-skip-permissions`, which would also unfence Bash (see Sandboxing below).
-- **WebFetch.** Fetches to unapproved domains are declined — Stage 3 needs package
-  registries and code hosting to verify the SDK version it designs against. Allowlist per
-  domain, either in the runner args (`models.yaml`): `"--allowedTools",
-  "WebFetch(domain:registry.npmjs.org)"` (repeat the flag per domain; verified to
-  accumulate), or in the target repo's `.claude/settings.json` under `permissions.allow`.
+- **Artifact writes never follow symlinks.** The runner's own writes — the tee'd log
+  under `docs/mcp/logs` and the `run-manifest.jsonl` append — go through `safe_open`
+  (`runner/run_stage.py`), which refuses a symlink target or a symlinked component under
+  `--docs`, refuses when the resolved path escapes the docs root, and opens with
+  `O_NOFOLLOW` where the OS supports it. Git stores symlinks as the link itself, so
+  without this a third-party clone shipping `docs/mcp/logs` (or `run-manifest.jsonl`) as
+  a symlink would turn the runner into an arbitrary-file write/append primitive; the
+  same containment is enforced by `new-project.sh` before it writes `run-config.env` /
+  `00-decisions.md`.
+- **Permissions are runner-owned, per stage.** `build_command` used to emit one identical
+  argv for every stage and silently honor the target repo's own `.claude/settings.json` —
+  so a third-party clone could widen the permission set. That is gone: every stage gets
+  `--settings` pointing at a settings file **shipped under this checkout**
+  (`runner/settings/claude-settings.json`, see `models.yaml`). Claude Code merges
+  permission rules across settings scopes, so the shipped file pairs the WebFetch
+  allowlist Stage 3 needs with hard **deny** rules — `Bash(*)` and `mcp__*` — and a deny
+  from any scope beats an allow from a lower one. The runner never passes the target
+  repo's file as the permission authority, so a clone can at most add allow rules
+  alongside the runner-owned deny — it cannot undo the deny. What the runner cannot do is
+  stop `claude` from also reading the repo's own `.claude/settings.json` /
+  `.claude/settings.local.json`, which can still grant things the deny rules do not cover
+  (e.g. `permissions.additionalDirectories`); that residual is Sandboxing's subject, and
+  the deny-beats-allow behavior itself is only pinned at the emitted-surface level — see
+  the verification caveat at the end of this bullet. Stage-specific tool allow/deny lists
+  come from the stage contract (only Stage 3 allows WebFetch; every other stage declines
+  it with `--disallowedTools WebFetch(*)`), and the claude runner passes
+  `--strict-mcp-config` with an explicit empty `--mcp-config {}`, instructing the session
+  to load no MCP servers at all; a target repo's `.mcp.json` is never part of the surface
+  the runner passes, and the `mcp__*` deny rule in the settings file backs that up even if
+  a `claude` build ignores the flag. The emitted argv is pinned by `--dry-run`, by the
+  unit probe (`runner/test_run_stage.py`), and by the committed read-only probe transcript
+  (`scratch-repo/probe-read-only-transcript.md`). Stage 9 sits on the same surface: like
+  the other artifact stages it resolves `acceptEdits` for its one deliverable
+  (`08-retro.md` under `docs/mcp`), and the playbook makes the retro **propose**, never
+  apply — the stage is instructed not to edit the playbook or anything else in this
+  installation, so a wrapped repo reaches the playbook only through the retro artifact
+  and the human who applies it: a review gate, not an automated path. That rule is
+  prompt-level, not a path bound in the runner (see the prompt-injection note in
+  Sandboxing; `mcp-server-creation-workflow.md` §Stage 9). Override the posture by editing
+  `models.yaml` (the runner args, `settings_file`, or `isolate_config`), never by editing
+  the target repo. The shipped default denies `Bash(*)` — and a deny cannot be overridden
+  by any `--allowedTools` — so if your stage personas run build/test commands (e.g. the
+  5/6 implement personas), add a per-runner variant whose `settings_file` allows the
+  specific commands you accept. If your `claude` build does not let `--settings` outrank
+  the project file, set `isolate_config: true` on the claude runner to run each stage
+  against a fresh empty `CLAUDE_CONFIG_DIR`. Then verify the deny-beats-allow behavior
+  once against your deployed `claude` build (scratch repo whose `.claude/settings.json`
+  allows `Bash(*)`; confirm the stage still declines) before relying on it in production.
 
 ### Validation status
 
@@ -183,12 +262,32 @@ Learned from running this pipeline, not assumed:
 
 ## Sandboxing
 
-This repo ships **no permission system**. From Stage 5 onward the agents have write access
-to the target repository, and they run whatever build, test and lint commands that project
-defines. Treat a pipeline run as executing untrusted code.
+The runner ships a per-stage permission **contract** — permission mode, and tool
+allow/deny lists, carried by runner-owned `--settings`, `--strict-mcp-config` and per-stage
+`--allowedTools`/`--disallowedTools` — but that is a policy for the agent's own tools, not
+a sandbox for the code it executes. Every artifact stage (2-9) resolves `acceptEdits`, so
+the agents have write access to the target repository from Stage 2 onward; only the
+onboarding stages 1a/1b are pinned read-only. The shipped default additionally denies
+`Bash(*)` — stages run build, test and lint commands only once you add a per-runner variant
+that allows the specific commands you accept. Treat a pipeline run as executing untrusted
+code.
+
+Permission scoping does not protect against **prompt injection**. The permission surface
+governs the agent's *tools*, not what the model is *told*: every stage agent reads the
+target repo's files and carries out the stage prompt, so a third-party clone can plant
+instructions in its code or docs that a model will follow with whatever tools its stage
+grants. Nothing in the permission contract addresses that — the deployment boundary does.
+
+The runner-owned settings file fences the permission *rules* (deny beats a merged allow),
+but Claude Code itself still reads `.claude/settings.json` and `.claude/settings.local.json`
+from the stage's working directory, and a clone can use those to grant things the runner
+cannot override — e.g. `permissions.additionalDirectories` (subject to Claude Code's
+workspace-trust handling, not to this repo). The hardening above closes the permission-rule
+surface; it does not replace the deployment boundary.
 
 Run it in a container, VM, or an agent sandbox with a policy you control, against a clone
-rather than your only copy of the repo. The reference run used a fresh clone on a
+rather than your only copy of the repo — and treat the clone's contents as untrusted
+input, not just its permission settings. The reference run used a fresh clone on a
 throwaway path for exactly this reason.
 
 ## Requirements
@@ -247,6 +346,8 @@ ORCHESTRATION.md                  execution models, and the anti-leakage rule
 new-project.sh                    scaffolds a run (Stage 0)
 models.example.yaml               model routing; copy to models.yaml
 runner/run_stage.py               resolves stage -> provider -> CLI, with fallback
+runner/stage_contract.py          per-stage artifact shapes, gates, permission surface
+runner/settings/claude-settings.json  runner-owned permission posture for claude stages
 agents/                           vendored agent personas (see NOTICE)
 templates/                        artifact skeletons for the structured stages
 ```

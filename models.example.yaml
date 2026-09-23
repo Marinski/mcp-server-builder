@@ -13,8 +13,11 @@
 #   opencode  - OpenAI-compatible (/v1/chat/completions) and every provider the Vercel AI
 #               SDK supports. This is what lets you point a stage at a local model, a
 #               LiteLLM gateway, or any OpenAI-compatible vendor.
-#   pi        - earendil-works/pi. Takes provider, model and key as separate flags, so it
-#               needs no env-var juggling, and `--mode json` is properly non-interactive.
+#   pi        - earendil-works/pi. Takes provider and model as separate flags, and
+#               `--mode json` is properly non-interactive. The credential is NOT a
+#               flag: give pi the provider's api_key_env below (see the pi examples),
+#               and never put a key on the command line — argv is exposed via ps and
+#               shell history. A runner that demands a key flag is unsupported here.
 #               Install: npm i -g @earendil-works/pi-coding-agent  (bin: `pi`)
 #
 # A gateway that speaks both shapes (LiteLLM does) can serve either runner.
@@ -22,21 +25,70 @@
 runners:
   claude:
     cmd: claude
-    # Non-interactive invocation. {model}/{provider}/{fallback}/{prompt_file} substitute.
-    # acceptEdits: a -p session has no TTY to answer a permission prompt, so an unanswered
-    # Write/Edit is silently declined by default — a stage that writes its own artifact
-    # (every stage does) fails closed with no file on disk and no salvageable output. This
-    # is narrower than --dangerously-skip-permissions: it only auto-accepts file edits, not
-    # arbitrary Bash execution.
-    args: ["-p", "--model", "{model}", "--fallback-model", "{fallback}", "--permission-mode", "acceptEdits"]
-    # WebFetch is gated the same way: a -p session declines fetches to domains that were
-    # never approved. Stage 3 needs package registries and code hosting to verify SDK
-    # versions (modelcontextprotocol.io tends to pass; npmjs / raw.githubusercontent do
-    # not). Verified fix: append per-domain allow rules to the args above, e.g.
-    #   "--allowedTools", "WebFetch(domain:registry.npmjs.org)", "--allowedTools", "WebFetch(domain:raw.githubusercontent.com)"
-    # Stage 3 also fetches github.com (the reference server's protocol-feature list, which
-    # sources its §4 checklist), so add "WebFetch(domain:github.com)" too.
-    # or put the same rules in the target repo's .claude/settings.json permissions.allow.
+    # Non-interactive invocation. {model}/{provider}/{fallback}/{prompt_file}/
+    # {stage}/{permission_mode}/{settings_file} substitute; the per-stage
+    # allowed/disallowed tool lists come from runner/stage_contract.py and are
+    # emitted through the *_tool_flag flags below.
+    #
+    # --permission-mode: a -p session has no TTY to answer a permission prompt,
+    # so an unanswered Write/Edit is silently declined by default — a stage
+    # that needs to write its artifact would fail closed with no file on disk
+    # and no salvageable output. acceptEdits auto-accepts file edits (never
+    # arbitrary Bash execution) and is resolved for the stages that write
+    # project artifacts (2-9). The read-only onboarding stages 1a/1b resolve
+    # the non-editing mode 'default' instead — pinned by the probe in
+    # runner/probe_read_only.py (transcript in scratch-repo/); their
+    # artifact-write exception is approximated, i.e. the stage's output
+    # documents are captured rather than written by its session. The value
+    # itself comes from the stage contract, so it can differ per stage.
+    #
+    # --settings {settings_file}: the lowest-scope settings come from a file
+    # shipped under THIS checkout (runner/settings/claude-settings.json), not
+    # from the target repo's .claude/settings.json. Claude Code merges
+    # permission rules across scopes, so the shipped file pairs its WebFetch
+    # allowlist with hard deny rules — Bash(*) and mcp__* — and a deny from
+    # any scope beats an allow from a lower one: a third-party clone can add
+    # allow rules, but cannot override the deny to widen the permission set.
+    # Override the file with `settings_file` on this runner (models.yaml is
+    # yours). The shipped default denies Bash(*) — and a deny cannot be
+    # overridden by any --allowedTools — so if your stage personas run
+    # build/test commands (e.g. the 5b/6 implement personas), add a separate
+    # runner variant whose `settings_file` allows the specific commands you
+    # accept; do not lift the deny unless you mean to. If your claude build
+    # does not make --settings outrank the project file, set
+    # `isolate_config: true` to run each stage against a fresh empty
+    # CLAUDE_CONFIG_DIR instead.
+    #
+    # --strict-mcp-config: only MCP servers named in --mcp-config are loaded;
+    # the explicit empty '{}' makes the session's MCP surface deterministically
+    # empty, so a target repo's .mcp.json (and any user-scope MCP config) is
+    # ignored. The deny mcp__* rule in the settings file backs this up even
+    # if a claude build ignores the flag.
+    args:
+      - "-p"
+      - "--model"
+      - "{model}"
+      - "--fallback-model"
+      - "{fallback}"
+      - "--permission-mode"
+      - "{permission_mode}"
+      - "--settings"
+      - "{settings_file}"
+      - "--strict-mcp-config"
+      - "--mcp-config"
+      - "{}"
+    # Per-stage tool surface, emitted as repeated flag/value pairs, e.g.
+    #   --allowedTools "WebFetch(domain:github.com)"
+    #   --disallowedTools "WebFetch(*)"
+    # opencode/pi have no such flags; leave these unset there.
+    allowed_tool_flag: "--allowedTools"
+    disallowed_tool_flag: "--disallowedTools"
+    # Runner-owned settings file under this checkout (see above). Relative
+    # paths resolve against the checkout root; absolute paths are used as-is.
+    settings_file: runner/settings/claude-settings.json
+    # Fallback isolation (see --settings above). Off by default because it also
+    # hides any OAuth login stored in ~/.claude.
+    isolate_config: false
     base_url_var: ANTHROPIC_BASE_URL
     api_key_var: ANTHROPIC_API_KEY
     # Claude Code can authenticate by OAuth, so a missing API key is not an error.

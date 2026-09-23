@@ -58,6 +58,48 @@ esac
 DOCS="${DOCS:-$REPO/docs/mcp}"
 mkdir -p "$DOCS"
 
+# Symlink-safe writes (finding 5405). Git stores symlinks as the link itself,
+# so a source repo can ship docs/mcp (the default DOCS) or the files below it
+# as symlinks that turn this scaffold — and the runner it sets up — into an
+# arbitrary-file write/append primitive. Refuse before writing when any
+# component of DOCS below the repo is a symlink, when the target file itself
+# is a symlink or exists as something other than a regular file, and when the
+# resolved target would escape the resolved DOCS dir.
+if [[ "$DOCS" == "$REPO" || "$DOCS" == "$REPO"/* ]]; then
+    _sub="${DOCS#"$REPO"}"
+    _sub="${_sub#/}"
+    if [[ -n "$_sub" ]]; then
+        _cur="$REPO"
+        while [[ -n "$_sub" ]]; do
+            _part="${_sub%%/*}"
+            _cur="$_cur/$_part"
+            if [[ -L "$_cur" ]]; then
+                echo "refusing to scaffold: $_cur is a symlink" >&2
+                exit 1
+            fi
+            _sub="${_sub:${#_part}}"
+            _sub="${_sub#/}"
+        done
+    fi
+fi
+_docs_real="$(realpath -m "$DOCS")"
+for _target in run-config.env 00-decisions.md; do
+    if [[ -L "$DOCS/$_target" ]]; then
+        echo "refusing to write $DOCS/$_target: it is a symlink" >&2
+        exit 1
+    fi
+    if [[ -e "$DOCS/$_target" && ! -f "$DOCS/$_target" ]]; then
+        echo "refusing to write $DOCS/$_target: not a regular file" >&2
+        exit 1
+    fi
+    _target_real="$(realpath -m "$DOCS/$_target")"
+    if [[ "$_target_real" != "$_docs_real"/* ]]; then
+        echo "refusing to write $DOCS/$_target: resolved path $_target_real escapes $_docs_real" >&2
+        exit 1
+    fi
+done
+unset _sub _cur _part _docs_real _target _target_real
+
 if [[ "$MODE" == "wrap" ]]; then
     CONSEQUENCE="the HTTP/CLI surface"
 else
