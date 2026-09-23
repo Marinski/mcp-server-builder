@@ -132,12 +132,21 @@ def preflight_check(stage: str, docs: Path | None,
                             f"with prior stage-5 manifest entry M={prev_m}")
 
 
+def _has_markdown_header(line: str) -> bool:
+    """Return True if a line looks like a markdown header (starts with one or more '#')."""
+    return line.startswith("#")
+
+
 def postflight_check(stage: str, docs: Path | None,
                      outputs: list[dict]) -> list[dict]:
     """After a successful run, record exists/size/mtime for tracked output paths.
 
     Stage 5: skip existence check (completion = ok attempt for phase N/M).
     Stage 9: skip entirely (returns empty).
+
+    For all other stages, validate that stage outputs match structural requirements:
+      - Non-empty content (not just whitespace).
+      - For single-file artifacts: presence of markdown-style headers.
     """
     if stage == "9" or docs is None:
         return outputs
@@ -155,14 +164,50 @@ def postflight_check(stage: str, docs: Path | None,
     for filename in contract.get("postflight_outputs", []):
         fpath = docs / filename
         exists = fpath.is_file()
+        
+        # Content validation: ensure the file has meaningful content beyond whitespace.
+        if exists and fpath.stat().st_size > 0:
+            lines = fpath.read_text().splitlines()
+            content_valid = any(line.strip() for line in lines)
+        else:
+            content_valid = False
+        
+        # Check for specific headers if SHAPE_SINGLE_FILE is used.
+        # A markdown header is a line beginning with one or more '#' characters.
+        header_valid = True
+        if contract.get("artifact_shape") == "single-file" and exists:
+            header_valid = any(_has_markdown_header(line) for line in fpath.read_text().splitlines())
+
         result.append({
             "path": str(fpath),
             "shape": contract["artifact_shape"],
             "exists": exists,
+            "content_valid": content_valid,
+            "header_valid": header_valid,
             "size": fpath.stat().st_size if exists else 0,
             "mtime": fpath.stat().st_mtime if exists else 0.0,
         })
     return result
+
+
+def _postflight_ok(postflight: list[dict]) -> bool:
+    """Whether every tracked output passed postflight_check's validation.
+
+    An attempt whose subprocess exits 0 but leaves a missing, empty, or
+    (for single-file artifacts) header-less output must not be reported as
+    a success — the caller falls through to the chain's next attempt, same
+    as a non-zero exit code. Entries without a validity field (stage 5,
+    stage 9, or no --docs — postflight_check returns the raw ``outputs``
+    argument unchanged in those cases) are not tracked artifacts and pass
+    trivially.
+    """
+    return all(
+        o.get("exists", True)
+        and o.get("content_valid", True)
+        and o.get("header_valid", True)
+        for o in postflight
+    )
+
 
 
 class LogCapture:
@@ -531,10 +576,13 @@ def run_stage_once(stage: str, cfg: dict, args: argparse.Namespace,
                        duration_s=duration_s, timed_out=timed_out,
                        phase=phase, outputs=postflight,
                        log_path=log_path, output_tail=tail)
-        if proc.returncode == 0:
+        if proc.returncode == 0 and _postflight_ok(postflight):
             print(f"  ok: {label}", file=sys.stderr)
             return 0
-        print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
+        if proc.returncode == 0:
+            print(f"  failed (postflight): {label}", file=sys.stderr)
+        else:
+            print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
 
     print("all attempts in the chain failed", file=sys.stderr)
     return 1
@@ -591,7 +639,8 @@ def _last_completed_phase(manifest_path: Path | None) -> int:
 def run_batch(args: argparse.Namespace) -> int:
     """Execute --batch: contiguous non-gated spans with human-gate stops.
 
-    Span A runs 1a then 1b sequentially (holding the lock).
+    Span A runs 1a then 1b sequentially (under the pipeline lock that
+    main() holds for the entire execution block).
     Stops before human-gated stages {2, 3, 4}.
     Span B handles stage 5's phase loop (last-completed+1 .. M, with
     automated verify-gate between phases).
@@ -601,240 +650,158 @@ def run_batch(args: argparse.Namespace) -> int:
     mf_path = args.manifest or (args.docs / "run-manifest.jsonl"
                                 if args.docs else None)
 
-    from lock import RunLock, LockError  # type: ignore[import]
     from run_state import first_pending_unit  # type: ignore[import]
     from stage_contract import STAGE_CONTRACT, STAGE_ORDER  # type: ignore[import]
 
-    # Acquire the lock for the entire batch duration.
-    try:
-        lock = RunLock(args.docs, mode="batch")
-        lock.acquire()
-    except LockError as exc:
-        sys.exit(str(exc))
+    # The pipeline lock is acquired once in main() before dispatch and held
+    # for the whole run, so batch mode does not acquire it itself.
 
-    try:
-        # Determine the starting stage.
-        if args.from_stage:
-            if args.from_stage not in STAGE_ORDER:
-                sys.exit(f"unknown stage '{args.from_stage}'")
-            start_stage = args.from_stage
-        else:
-            unit = first_pending_unit(mf_path, args.docs, None)
-            if unit is None:
-                print("nothing to run: every stage is done", file=sys.stderr)
-                return 0
-            start_stage = unit.split()[0]
+    # Determine the starting stage.
+    if args.from_stage:
+        if args.from_stage not in STAGE_ORDER:
+            sys.exit(f"unknown stage '{args.from_stage}'")
+        start_stage = args.from_stage
+    else:
+        unit = first_pending_unit(mf_path, args.docs, None)
+        if unit is None:
+            print("nothing to run: every stage is done", file=sys.stderr)
+            return 0
+        start_stage = unit.split()[0]
 
-        # Starting at a human-gated stage in batch mode is an error.
-        if STAGE_CONTRACT.get(start_stage, {}).get("human_gated"):
+    # Starting at a human-gated stage in batch mode is an error.
+    if STAGE_CONTRACT.get(start_stage, {}).get("human_gated"):
+        print(
+            f"batch: stage {start_stage} requires a human gate — "
+            f"run it yourself: ./runner/run_stage.py {start_stage}"
+            f" --docs {args.docs}",
+            file=sys.stderr,
+        )
+        return 0
+
+    start_idx = STAGE_ORDER.index(start_stage)
+    prompt_file = args.prompt.resolve() if args.prompt else Path(os.devnull)
+
+    for idx in range(start_idx, len(STAGE_ORDER)):
+        stage = STAGE_ORDER[idx]
+
+        # Human-gated stage: stop and instruct.
+        if STAGE_CONTRACT.get(stage, {}).get("human_gated"):
             print(
-                f"batch: stage {start_stage} requires a human gate — "
-                f"run it yourself: ./runner/run_stage.py {start_stage}"
+                f"next stage {stage} requires a human gate — "
+                f"run it yourself: ./runner/run_stage.py {stage}"
                 f" --docs {args.docs}",
                 file=sys.stderr,
             )
             return 0
 
-        start_idx = STAGE_ORDER.index(start_stage)
-        prompt_file = args.prompt.resolve() if args.prompt else Path(os.devnull)
+        # ── Stage 5: phase loop (Span B) ──────────────────────────
+        if stage == "5":
+            # Determine M (total phases).
+            if args.phases is not None:
+                phase_total = args.phases
+            else:
+                phase_total = _resolve_prior_phase_total(mf_path)
+                if phase_total is None:
+                    print(
+                        "stage 5 needs --phases M — rerun as: "
+                        "run_stage.py --batch --phases M",
+                        file=sys.stderr,
+                    )
+                    return 0
 
-        for idx in range(start_idx, len(STAGE_ORDER)):
-            stage = STAGE_ORDER[idx]
+            # Find the last completed phase.
+            last_completed = _last_completed_phase(mf_path)
 
-            # Human-gated stage: stop and instruct.
-            if STAGE_CONTRACT.get(stage, {}).get("human_gated"):
+            for n in range(last_completed + 1, phase_total + 1):
+                phase = f"{n}/{phase_total}"
+                print(f"\n── batch: stage 5 phase {phase} ──",
+                      file=sys.stderr)
+
+                # Re-read cfg to pick up any changes.
+                cfg = load_config(args.config)
+                rc = run_stage_once(
+                    "5", cfg, args, prompt_file, phase=phase)
+                if rc != 0:
+                    print(
+                        f"batch: stage 5 phase {phase} failed",
+                        file=sys.stderr,
+                    )
+                    return rc
+
+                # Automated verify-gate between phases (not after
+                # the last phase).
+                if n < phase_total:
+                    print(
+                        f"\n── verify-gate: stage 5 phase {phase} "
+                        f"complete ──", file=sys.stderr)
+                    # The verify-gate runs outside this script; the
+                    # user must run ready-to-push or equivalent.
+
+            continue  # proceed to Span C
+
+        # ── Spans A & C: run non-gated stages ─────────────────────
+        print(f"\n── batch: stage {stage} ──", file=sys.stderr)
+
+        # Re-read cfg each stage.
+        cfg = load_config(args.config)
+
+        # Check if stage is already done.
+        from run_state import compute_run_states  # type: ignore[import]
+        states = compute_run_states(mf_path, args.docs)
+        # For stage 5 (not in this branch) and stage 9, state is
+        # always "done" if any record exists. For other stages,
+        # check the unit name directly.
+        stage_state = states.get(stage, "not-started")
+
+        if stage_state == "done" and not args.force:
+            print(f"  stage {stage}: done, skipping", file=sys.stderr)
+            continue
+
+        if stage_state == "done" and args.force:
+            # --force re-runs a done stage; check for drift first.
+            drift = detect_drift(stage, mf_path)
+            if drift and not args.confirm_overwrite:
                 print(
-                    f"next stage {stage} requires a human gate — "
-                    f"run it yourself: ./runner/run_stage.py {stage}"
-                    f" --docs {args.docs}",
+                    f"stage {stage}: drift detected on "
+                    f"{len(drift)} tracked output(s):",
                     file=sys.stderr,
                 )
-                return 0
-
-            # ── Stage 5: phase loop (Span B) ──────────────────────────
-            if stage == "5":
-                # Determine M (total phases).
-                if args.phases is not None:
-                    phase_total = args.phases
-                else:
-                    phase_total = _resolve_prior_phase_total(mf_path)
-                    if phase_total is None:
-                        print(
-                            "stage 5 needs --phases M — rerun as: "
-                            "run_stage.py --batch --phases M",
-                            file=sys.stderr,
-                        )
-                        return 0
-
-                # Find the last completed phase.
-                last_completed = _last_completed_phase(mf_path)
-
-                for n in range(last_completed + 1, phase_total + 1):
-                    phase = f"{n}/{phase_total}"
-                    print(f"\n── batch: stage 5 phase {phase} ──",
-                          file=sys.stderr)
-
-                    # Re-read cfg to pick up any changes.
-                    cfg = load_config(args.config)
-                    rc = run_stage_once(
-                        "5", cfg, args, prompt_file, phase=phase)
-                    if rc != 0:
-                        print(
-                            f"batch: stage 5 phase {phase} failed",
-                            file=sys.stderr,
-                        )
-                        return rc
-
-                    # Automated verify-gate between phases (not after
-                    # the last phase).
-                    if n < phase_total:
-                        print(
-                            f"\n── verify-gate: stage 5 phase {phase} "
-                            f"complete ──", file=sys.stderr)
-                        # The verify-gate runs outside this script; the
-                        # user must run ready-to-push or equivalent.
-
-                continue  # proceed to Span C
-
-            # ── Spans A & C: run non-gated stages ─────────────────────
-            print(f"\n── batch: stage {stage} ──", file=sys.stderr)
-
-            # Re-read cfg each stage.
-            cfg = load_config(args.config)
-
-            # Check if stage is already done.
-            from run_state import compute_run_states  # type: ignore[import]
-            states = compute_run_states(mf_path, args.docs)
-            # For stage 5 (not in this branch) and stage 9, state is
-            # always "done" if any record exists. For other stages,
-            # check the unit name directly.
-            stage_state = states.get(stage, "not-started")
-
-            if stage_state == "done" and not args.force:
-                print(f"  stage {stage}: done, skipping", file=sys.stderr)
-                continue
-
-            if stage_state == "done" and args.force:
-                # --force re-runs a done stage; check for drift first.
-                drift = detect_drift(stage, mf_path)
-                if drift and not args.confirm_overwrite:
+                for d in drift:
                     print(
-                        f"stage {stage}: drift detected on "
-                        f"{len(drift)} tracked output(s):",
+                        f"  {d['path']}: "
+                        f"size {d['expected_size']}→{d['actual_size']}, "
+                        f"mtime {d['expected_mtime']}→{d['actual_mtime']}",
                         file=sys.stderr,
                     )
-                    for d in drift:
-                        print(
-                            f"  {d['path']}: "
-                            f"size {d['expected_size']}→{d['actual_size']}, "
-                            f"mtime {d['expected_mtime']}→{d['actual_mtime']}",
-                            file=sys.stderr,
-                        )
-                    print(
-                        f"use --force --confirm-overwrite to proceed",
-                        file=sys.stderr,
-                    )
-                    return 1
-                if drift:
-                    print(
-                        f"  stage {stage}: --force overriding "
-                        f"{len(drift)} drifted output(s)",
-                        file=sys.stderr,
-                    )
+                print(
+                    f"use --force --confirm-overwrite to proceed",
+                    file=sys.stderr,
+                )
+                return 1
+            if drift:
+                print(
+                    f"  stage {stage}: --force overriding "
+                    f"{len(drift)} drifted output(s)",
+                    file=sys.stderr,
+                )
 
-            rc = run_stage_once(stage, cfg, args, prompt_file)
-            if rc != 0:
-                print(f"batch: stage {stage} failed", file=sys.stderr)
-                return rc
+        rc = run_stage_once(stage, cfg, args, prompt_file)
+        if rc != 0:
+            print(f"batch: stage {stage} failed", file=sys.stderr)
+            return rc
 
-        print("\nbatch: all non-gated stages complete", file=sys.stderr)
-        return 0
-
-    finally:
-        lock.release()
+    print("\nbatch: all non-gated stages complete", file=sys.stderr)
+    return 0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", nargs="?", default=None,
-                    help="stage id as used in models.yaml (1a, 1b, 2, ... 9); "
-                         "omit to auto-select the next stage that is not 'done'")
-    ap.add_argument("--from", dest="from_stage", default=None,
-                    help="start at this stage, skipping stages already 'done'; "
-                         "cannot be combined with a positional stage")
-    ap.add_argument("--status", action="store_true",
-                    help="print every stage's computed state and exit "
-                         "(requires --docs)")
-    ap.add_argument("--version", action="version",
-                    version=f"%(prog)s {VERSION}")
-    ap.add_argument("--config", type=Path, default=ROOT / "models.yaml")
-    ap.add_argument("--prompt", type=Path, help="file containing the stage prompt")
-    ap.add_argument("--docs", type=Path,
-                    help="artifact dir; also the default for --manifest and --cwd")
-    ap.add_argument("--cwd", type=Path,
-                    help="working directory for the stage's CLI process (default: two levels "
-                         "above --docs, which is the target repo when DOCS is <repo>/docs/mcp). "
-                         "Claude Code confines file access to the directory it is launched "
-                         "from, so this must contain the target repo — not wherever this "
-                         "script was invoked from.")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="print the resolved chain and commands without running")
-    ap.add_argument("--manifest", type=Path,
-                    help="append a record of what actually ran to this JSONL file "
-                         "(default: <docs>/run-manifest.jsonl when --docs is given)")
-    ap.add_argument("--phase", type=str, default=None,
-                     help="phase tracking string 'N/M' (stage 5 only, e.g. '2/5')")
-    ap.add_argument("--log-path", type=str, default=None,
-                     help="path to the tee'd log file for this run")
-    ap.add_argument("--timeout", type=int, default=None,
-                     help=f"subprocess timeout in seconds (default: {DEFAULT_TIMEOUT})")
-    ap.add_argument("--batch", action="store_true",
-                     help="run contiguous non-gated spans in one process; "
-                          "stops before human-gated stages {2, 3, 4} "
-                          "and requires --phases for stage 5")
-    ap.add_argument("--phases", type=int, default=None, metavar="M",
-                     help="total number of phases for stage 5 (e.g. 5 for '1/5' .. '5/5')")
-    ap.add_argument("--force", action="store_true",
-                     help="re-run a 'done' stage, checking for output drift first")
-    ap.add_argument("--confirm-overwrite", action="store_true",
-                     help="proceed past drift detection when used with --force")
-    args = ap.parse_args()
+def run_single(args: argparse.Namespace, mf_path: Path | None) -> int:
+    """Execute one stage — positional or auto-selected — to completion.
 
-    mf_path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
-
-    if args.status:
-        if args.docs is None:
-            sys.exit("--status requires --docs (the manifest lives at "
-                     "<docs>/run-manifest.jsonl)")
-        from run_state import compute_run_states, live_lock_pid  # type: ignore[import]
-        states = compute_run_states(mf_path, args.docs)
-        width = max([len(u) for u in states] + [len("stage")])
-        print(f"{'stage':<{width}}  state")
-        for unit, state in states.items():
-            print(f"{unit:<{width}}  {state}")
-        lock_pid = live_lock_pid(args.docs)
-        if lock_pid is not None:
-            print(f"# run lock held by live pid {lock_pid}", file=sys.stderr)
-        return 0
-
-    if args.from_stage is not None and args.stage is not None:
-        sys.exit("--from STAGE cannot be combined with a positional stage")
-
-    # --confirm-overwrite requires --force.
-    if args.confirm_overwrite and not args.force:
-        sys.exit("--confirm-overwrite requires --force")
-
-    # --batch: run contiguous non-gated spans with human-gate stops.
-    if args.batch:
-        if args.docs is None:
-            sys.exit("--batch requires --docs")
-        if args.stage is not None:
-            sys.exit("--batch cannot be combined with a positional stage")
-        if args.phases is not None and args.phases < 1:
-            sys.exit("--phases M must be >= 1")
-        return run_batch(args)
-
+    Runs under the pipeline lock that main() acquired for the whole
+    execution block: resolve chain → pre-flight → subprocess(es) with
+    timeout → post-flight → manifest record, walking the fallback chain.
+    Returns the exit code (0 for success, non-zero for failure).
+    """
     if args.stage is None:
         from run_state import first_pending_unit  # type: ignore[import]
         try:
@@ -949,15 +916,129 @@ def main() -> int:
                         duration_s=duration_s, timed_out=timed_out,
                         phase=args.phase, outputs=postflight,
                         log_path=log_path, output_tail=tail)
-        if proc.returncode == 0:
+        if proc.returncode == 0 and _postflight_ok(postflight):
             print(f"  ok: {label}", file=sys.stderr)
             return 0
-        print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
+        if proc.returncode == 0:
+            print(f"  failed (postflight): {label}", file=sys.stderr)
+        else:
+            print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
 
     if args.dry_run:
         return 0
     print("all attempts in the chain failed", file=sys.stderr)
     return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("stage", nargs="?", default=None,
+                    help="stage id as used in models.yaml (1a, 1b, 2, ... 9); "
+                         "omit to auto-select the next stage that is not 'done'")
+    ap.add_argument("--from", dest="from_stage", default=None,
+                    help="start at this stage, skipping stages already 'done'; "
+                         "cannot be combined with a positional stage")
+    ap.add_argument("--status", action="store_true",
+                    help="print every stage's computed state and exit "
+                         "(requires --docs)")
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {VERSION}")
+    ap.add_argument("--config", type=Path, default=ROOT / "models.yaml")
+    ap.add_argument("--prompt", type=Path, help="file containing the stage prompt")
+    ap.add_argument("--docs", type=Path,
+                    help="artifact dir; also the default for --manifest and --cwd")
+    ap.add_argument("--cwd", type=Path,
+                    help="working directory for the stage's CLI process (default: two levels "
+                         "above --docs, which is the target repo when DOCS is <repo>/docs/mcp). "
+                         "Claude Code confines file access to the directory it is launched "
+                         "from, so this must contain the target repo — not wherever this "
+                         "script was invoked from.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the resolved chain and commands without running; "
+                         "still holds the run lock when --docs is given")
+    ap.add_argument("--manifest", type=Path,
+                    help="append a record of what actually ran to this JSONL file "
+                         "(default: <docs>/run-manifest.jsonl when --docs is given)")
+    ap.add_argument("--phase", type=str, default=None,
+                     help="phase tracking string 'N/M' (stage 5 only, e.g. '2/5')")
+    ap.add_argument("--log-path", type=str, default=None,
+                     help="path to the tee'd log file for this run")
+    ap.add_argument("--timeout", type=int, default=None,
+                     help=f"subprocess timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    ap.add_argument("--batch", action="store_true",
+                     help="run contiguous non-gated spans in one process; "
+                          "stops before human-gated stages {2, 3, 4} "
+                          "and requires --phases for stage 5")
+    ap.add_argument("--phases", type=int, default=None, metavar="M",
+                     help="total number of phases for stage 5 (e.g. 5 for '1/5' .. '5/5')")
+    ap.add_argument("--force", action="store_true",
+                     help="re-run a 'done' stage, checking for output drift first")
+    ap.add_argument("--confirm-overwrite", action="store_true",
+                     help="proceed past drift detection when used with --force")
+    args = ap.parse_args()
+
+    mf_path = args.manifest or (args.docs / "run-manifest.jsonl" if args.docs else None)
+
+    if args.status:
+        if args.docs is None:
+            sys.exit("--status requires --docs (the manifest lives at "
+                     "<docs>/run-manifest.jsonl)")
+        from run_state import compute_run_states, live_lock_pid  # type: ignore[import]
+        states = compute_run_states(mf_path, args.docs)
+        width = max([len(u) for u in states] + [len("stage")])
+        print(f"{'stage':<{width}}  state")
+        for unit, state in states.items():
+            print(f"{unit:<{width}}  {state}")
+        lock_pid = live_lock_pid(args.docs)
+        if lock_pid is not None:
+            print(f"# run lock held by live pid {lock_pid}", file=sys.stderr)
+        return 0
+
+    if args.from_stage is not None and args.stage is not None:
+        sys.exit("--from STAGE cannot be combined with a positional stage")
+
+    # --confirm-overwrite requires --force.
+    if args.confirm_overwrite and not args.force:
+        sys.exit("--confirm-overwrite requires --force")
+
+    # --batch: run contiguous non-gated spans with human-gate stops.
+    # Usage validation happens before the lock: a bad invocation must be
+    # reported even while another run holds the lock.
+    if args.batch:
+        if args.docs is None:
+            sys.exit("--batch requires --docs")
+        if args.stage is not None:
+            sys.exit("--batch cannot be combined with a positional stage")
+        if args.phases is not None and args.phases < 1:
+            sys.exit("--phases M must be >= 1")
+
+    # ── Pipeline lock: held for the entire execution block ──────────────
+    # Every mode that executes a stage — --batch, a positional stage, an
+    # auto-selected stage, and --dry-run — acquires the run lock, so two
+    # invocations cannot clobber the same docs tree or manifest. Previously
+    # only --batch mode did, leaving single-stage runs unguarded. --status
+    # stays lock-free: its job is to observe a run in progress. Without
+    # --docs there is no lock path and nothing is written, so there is
+    # nothing to serialize.
+    from lock import RunLock, LockError  # type: ignore[import]
+
+    lock = None
+    if args.docs is not None:
+        try:
+            lock = RunLock(args.docs,
+                           mode="batch" if args.batch else "single")
+            lock.acquire()
+        except LockError as exc:
+            sys.exit(str(exc))
+
+    try:
+        if args.batch:
+            return run_batch(args)
+        return run_single(args, mf_path)
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":
