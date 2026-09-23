@@ -190,6 +190,25 @@ def postflight_check(stage: str, docs: Path | None,
     return result
 
 
+def _postflight_ok(postflight: list[dict]) -> bool:
+    """Whether every tracked output passed postflight_check's validation.
+
+    An attempt whose subprocess exits 0 but leaves a missing, empty, or
+    (for single-file artifacts) header-less output must not be reported as
+    a success — the caller falls through to the chain's next attempt, same
+    as a non-zero exit code. Entries without a validity field (stage 5,
+    stage 9, or no --docs — postflight_check returns the raw ``outputs``
+    argument unchanged in those cases) are not tracked artifacts and pass
+    trivially.
+    """
+    return all(
+        o.get("exists", True)
+        and o.get("content_valid", True)
+        and o.get("header_valid", True)
+        for o in postflight
+    )
+
+
 
 class LogCapture:
     """Tee stdout+stderr to a log file while streaming to console.
@@ -557,10 +576,13 @@ def run_stage_once(stage: str, cfg: dict, args: argparse.Namespace,
                        duration_s=duration_s, timed_out=timed_out,
                        phase=phase, outputs=postflight,
                        log_path=log_path, output_tail=tail)
-        if proc.returncode == 0:
+        if proc.returncode == 0 and _postflight_ok(postflight):
             print(f"  ok: {label}", file=sys.stderr)
             return 0
-        print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
+        if proc.returncode == 0:
+            print(f"  failed (postflight): {label}", file=sys.stderr)
+        else:
+            print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
 
     print("all attempts in the chain failed", file=sys.stderr)
     return 1
@@ -894,10 +916,13 @@ def run_single(args: argparse.Namespace, mf_path: Path | None) -> int:
                         duration_s=duration_s, timed_out=timed_out,
                         phase=args.phase, outputs=postflight,
                         log_path=log_path, output_tail=tail)
-        if proc.returncode == 0:
+        if proc.returncode == 0 and _postflight_ok(postflight):
             print(f"  ok: {label}", file=sys.stderr)
             return 0
-        print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
+        if proc.returncode == 0:
+            print(f"  failed (postflight): {label}", file=sys.stderr)
+        else:
+            print(f"  failed ({proc.returncode}): {label}", file=sys.stderr)
 
     if args.dry_run:
         return 0

@@ -91,6 +91,10 @@ def test_single_stage_run_holds_lock_while_executing_and_releases(
 ) -> None:
     docs = tmp_path / "docs"
     docs.mkdir()
+    # The fake runner never touches the filesystem, so stage 1a's tracked
+    # output must already be a valid artifact for postflight to pass.
+    (docs / "01-instructions.md").write_text(
+        "# Instructions\n\nReal content.\n", encoding="utf-8")
     stop = tmp_path / "stop"
     _write_blocking_runner(tmp_path)
     env = os.environ.copy()
@@ -179,6 +183,13 @@ def test_batch_run_holds_lock_through_main_and_releases(
 ) -> None:
     docs = tmp_path / "docs"
     docs.mkdir()
+    # Batch runs 1a then 1b before the human gate at stage 2; the fake
+    # runner never touches the filesystem, so both tracked outputs must
+    # already be valid artifacts for postflight to pass.
+    (docs / "01-instructions.md").write_text(
+        "# Instructions\n\nReal content.\n", encoding="utf-8")
+    (docs / "01-signatures.md").write_text(
+        "# Signatures\n\nReal content.\n", encoding="utf-8")
     stop = tmp_path / "stop"
     _write_blocking_runner(tmp_path)
     env = os.environ.copy()
@@ -233,3 +244,107 @@ def test_status_remains_lock_free_and_reports_live_lock(
         assert f"run lock held by live pid {os.getpid()}" in proc.stderr
     finally:
         holder.release()
+
+
+class TestPostflightEnforcement:
+    """postflight_check's content_valid/header_valid must actually gate
+    success, not just ride along in the manifest as inert metadata — a
+    subprocess that exits 0 but leaves a missing, empty, or (for a
+    single-file artifact) header-less output is not a successful attempt.
+    """
+
+    def test_ok_true_only_when_every_output_is_fully_valid(self) -> None:
+        from run_stage import _postflight_ok
+
+        assert _postflight_ok([
+            {"exists": True, "content_valid": True, "header_valid": True},
+        ])
+        assert _postflight_ok([
+            {"exists": True, "content_valid": True, "header_valid": True},
+            {"exists": True, "content_valid": True, "header_valid": True},
+        ])
+
+    def test_missing_output_fails(self) -> None:
+        from run_stage import _postflight_ok
+
+        assert not _postflight_ok([
+            {"exists": False, "content_valid": False, "header_valid": True},
+        ])
+
+    def test_empty_or_whitespace_only_output_fails(self) -> None:
+        from run_stage import _postflight_ok
+
+        assert not _postflight_ok([
+            {"exists": True, "content_valid": False, "header_valid": True},
+        ])
+
+    def test_single_file_artifact_missing_header_fails(self) -> None:
+        from run_stage import _postflight_ok
+
+        assert not _postflight_ok([
+            {"exists": True, "content_valid": True, "header_valid": False},
+        ])
+
+    def test_one_bad_output_among_several_fails_the_whole_attempt(self) -> None:
+        from run_stage import _postflight_ok
+
+        assert not _postflight_ok([
+            {"exists": True, "content_valid": True, "header_valid": True},
+            {"exists": True, "content_valid": False, "header_valid": True},
+        ])
+
+    def test_entries_without_validity_fields_pass_trivially(self) -> None:
+        """postflight_check returns the raw ``outputs`` argument unchanged
+        for stage 5, stage 9, and when --docs is not given — those entries
+        carry no exists/content_valid/header_valid keys at all and must not
+        be mistaken for failures."""
+        from run_stage import _postflight_ok
+
+        assert _postflight_ok([{"stage": "5", "phase": "1/3"}])
+        assert _postflight_ok([])
+
+    def test_postflight_check_flags_empty_file_as_content_invalid(
+        self, tmp_path: Path,
+    ) -> None:
+        from run_stage import postflight_check
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "01-instructions.md").write_text("", encoding="utf-8")
+
+        result = postflight_check("1a", docs, [])
+
+        assert len(result) == 1
+        assert result[0]["exists"] is True
+        assert result[0]["content_valid"] is False
+
+    def test_postflight_check_flags_single_file_artifact_missing_header(
+        self, tmp_path: Path,
+    ) -> None:
+        from run_stage import postflight_check
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        # Non-empty, so content_valid — but no markdown header, and stage
+        # 1a's artifact_shape is single-file.
+        (docs / "01-instructions.md").write_text(
+            "just a plain paragraph, no header\n", encoding="utf-8")
+
+        result = postflight_check("1a", docs, [])
+
+        assert result[0]["content_valid"] is True
+        assert result[0]["header_valid"] is False
+
+    def test_postflight_check_passes_a_real_valid_artifact(
+        self, tmp_path: Path,
+    ) -> None:
+        from run_stage import postflight_check, _postflight_ok
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "01-instructions.md").write_text(
+            "# Instructions\n\nReal content.\n", encoding="utf-8")
+
+        result = postflight_check("1a", docs, [])
+
+        assert _postflight_ok(result)
